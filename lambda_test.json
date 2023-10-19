@@ -1,0 +1,7 @@
+{
+  "body": "{\"name\":\"1382_test_1\"}",
+  "resource": "/",
+  "path": "/start_experiment",
+  "httpMethod": "POST",
+  "requestContext": {}
+}

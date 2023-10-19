@@ -1,0 +1,25 @@
+version: '3'
+services:
+  my_lambda_debugger:
+    image: plasmid_seq:latest
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AWS_ACCESS_KEY_ID=AKIAV6QNRJBJ5ALNUUPZ
+      - AWS_SECRET_ACCESS_KEY=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
+      - PYTHONPATH=/var/lang/lib:/lib64:/usr/lib64:/var/runtime:/var/runtime/lib:/var/task:/var/task/lib:/opt/lib
+    volumes:
+      - /var/lang/lib
+      - /lib64
+      - /usr/lib64
+      - /var/runtime
+      - /var/runtime/lib
+      - /var/task
+      - /var/task/lib
+      - /opt/lib
+    ports:
+      - 5678:5678
+      - 9000:8080
+    security_opt:
+      - seccomp:unconfined
+#    entrypoint: /lambda-entrypoint.sh app.handler
+#    command: /var/lang/bin/python3 -m awslambdaric app.handler

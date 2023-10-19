@@ -1,0 +1,44 @@
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install Java & other utilities
+RUN yum install -y wget tar unzip java-1.8.0-openjdk
+
+# Install fastp
+RUN wget http://opengene.org/fastp/fastp; chmod a+x ./fastp; mv ./fastp /usr/bin/fastp
+
+# Install Trimmomatic
+COPY Trimmomatic-0.39.zip .
+RUN unzip Trimmomatic-0.39.zip
+
+# Install SPAdes
+COPY SPAdes-3.15.5-Linux.tar.gz .
+RUN tar zxf SPAdes-3.15.5-Linux.tar.gz
+
+# Install Unicycler w/ NCBI dependencies
+COPY sratoolkit.2.10.9-centos_linux64-cloud.tar.gz .
+RUN tar xzf sratoolkit.2.10.9-centos_linux64-cloud.tar.gz -C /
+ENV PATH "$PATH:/usr/local/ncbi/sra-tools/bin"
+COPY ./unicycler-0.5.0-py3-none-any.whl unicycler/
+RUN python3 -m pip install unicycler/unicycler-0.5.0-py3-none-any.whl
+
+# Install Foundry Backend
+ARG SPACE_UN
+ARG SPACE_TOKEN
+RUN python3 -m pip install foundrybackend -i https://$SPACE_UN:$SPACE_TOKEN@pypi.pkg.jetbrains.space/grobio-foundry/p/wf-dev/grobio-foundry-pypi/simple
+
+## Install samtools & bcftools
+#COPY samtools.tar.gz .
+#RUN tar -xzf samtools.tar.gz -C /usr/local
+#COPY bcftools.tar.gz .
+#RUN tar -xzf bcftools.tar.gz -C /usr/local
+#
+## Install exonerate
+#COPY exonerate.tar.gz .
+#RUN tar -xzf exonerate.tar.gz -C /usr/local
+
+
+
+# Add locations to PATH
+ENV PATH "$PATH:/usr/local/ncbi/sra-tools/bin:/var/task/Trimmomatic-0.39:/var/task/SPAdes-3.15.5-Linux/bin:/usr/local/samtools/bin:/usr/local/bcftools/bin:/usr/local/exonerate/bin"
+
+CMD [ "function.handler" ]

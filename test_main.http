@@ -1,0 +1,10 @@
+# Test your FastAPI endpoints
+
+GET http://192.168.135.66:8080/
+
+###
+
+GET http://192.168.135.66:8080/hello/robert
+Accept: application/json
+
+###
