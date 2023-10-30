@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union
 
 import boto3
 from sqlmodel import SQLModel, Field, create_engine, Relationship
@@ -37,8 +37,15 @@ class PlasmidSeqRun(LambdaMixin, table=True):
         return path
 
 
+class MapStatusInfo(SQLModel):
+    Status: Optional[str]
+    Error: Optional[str]
+    Cause: Optional[str]
+
+
 class PlasmidSeqRunList(LambdaMixin):
-    runs: List[PlasmidSeqRun]
+    runs: List[Union[PlasmidSeqRun, MapStatusInfo]]
+
 
 class ExperimentStartModel(LambdaMixin):
     name: str

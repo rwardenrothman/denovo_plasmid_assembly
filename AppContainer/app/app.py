@@ -9,11 +9,13 @@ from zipfile import ZipFile
 import boto3
 import pandas as pd
 import uvicorn
+import pydna.all as pyd
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from fastapi import FastAPI, Response, Request, HTTPException
 from fastapi.routing import APIRoute
 from fastapi.responses import FileResponse, JSONResponse
+from gfapy import Gfa
 from mangum import Mangum
 from mangum.types import LambdaEvent
 from sqlmodel import Session, select
@@ -22,13 +24,13 @@ from aws_lambda_powertools import Logger
 
 if 'AppContainer' in __file__:
     from .denovo_from_paper import *
-    from .helpers import add_files
+    from .helpers import add_files, plasmids_from_gfa
     from .annotation_propagation import align_sequences
     from .basespace import basespace_get
     from .db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList
 else:
     from denovo_from_paper import *
-    from helpers import add_files
+    from helpers import add_files, plasmids_from_gfa
     from annotation_propagation import align_sequences
     from basespace import basespace_get
     from db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList
@@ -46,11 +48,16 @@ class LoggerRouteHandler(APIRoute):
                 "path": request.url.path,
                 "route": self.path,
                 "method": request.method,
+                "body": request.scope['aws.event']['body']
             }
             logger.append_keys(fastapi=ctx)
             logger.info("Received request")
 
             response = await original_route_handler(request)
+            ctx["body"] = response.body
+            logger.append_keys(fastapi=ctx)
+            logger.info("Successfully completed request")
+
             return response
 
         return route_handler
@@ -88,18 +95,20 @@ async def unhandled_exception_handler(request: Request, err: Exception):
 
     event_body = request.scope['aws.event']['body']
     psr = PlasmidSeqRun.parse_raw(event_body)
+    error_message = '; '.join(map(str, err.args))
+    error_type = type(err).__name__
     if psr.id and psr.data_id and psr.experiment_id:
         with Session(engine) as session:
             db_psr = session.get(PlasmidSeqRun, psr.id)
             db_psr.last_step = 'Error'
-            db_psr.error_type = type(err).__name__
-            db_psr.error_message = str(err.args)
+            db_psr.error_type = error_type
+            db_psr.error_message = error_message
             db_psr.error_path = request.url.path
             session.commit()
 
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error",
-                                                  "ExceptionType": type(err).__name__,
-                                                  "ExceptionMessage": str(err.args)})
+                                                  "ExceptionType": error_type,
+                                                  "ExceptionMessage": error_message})
 
 
 @app.post('/start_experiment', response_model=PlasmidSeqRunList)
@@ -119,7 +128,7 @@ async def setup(job: PlasmidSeqRun):
 
     logger.info(f'{job.data_id} - Importing LabGuruAPI')
     from LabGuruAPI import Plasmid, SESSION
-    SESSION.set_config_value('AUTH', 'TOKEN', '3f230385c03b409bb506478edeb0777624e60c22')
+    SESSION.set_config_value('AUTH', 'TOKEN', os.environ['LG_AUTH_TOKEN'])
     tmp_folder = Path('/tmp') / job.data_path('setup_step')
     logger.info(f'{job.data_id} - Making Temp Folder')
     tmp_folder.mkdir(exist_ok=True, parents=True)
@@ -218,10 +227,15 @@ async def trim_fastqs(job: PlasmidSeqRun):
     return job
 
 
-@app.post('/assembly_status', response_model=PlasmidSeqRun)
-async def assembly_status(job: PlasmidSeqRun):
-    if job.last_step == 'Trim':
-        return JSONResponse(status_code=527, content={"detail": f'Still processing job {job.data_path()}'})
+@app.post('/check_transition/{from_state}/{to_state}', response_model=PlasmidSeqRun)
+async def assembly_status(job: PlasmidSeqRun, from_state: str, to_state: str):
+    with Session(engine) as session:
+        job = session.get(PlasmidSeqRun, job.id)
+    if job.last_step.lower() == from_state.lower():
+        return JSONResponse(status_code=527,
+                            content={"detail": f'Job {job.data_path()} is still in state {from_state}.'})
+    elif job.last_step.lower() == to_state.lower():
+        return job
     elif job.last_step == 'Error':
         return JSONResponse(status_code=500, content={"detail": "Internal Server Error",
                                                       "ExceptionType": job.error_type,
@@ -272,6 +286,15 @@ async def assemble(job: PlasmidSeqRun):
         raise TimeoutError(f'{job.data_path()} could not be assembled in 14 min.')
 
     validate_file(assembly_fasta)
+
+    assembly_gfa = Gfa.from_file(assembly_fasta.replace('.fasta', '.gfa'))
+    assembly_seqs = plasmids_from_gfa(assembly_gfa)
+    records = [pyd.Dseqrecord(s, id=f"Component_{i + 1}", circular=True) for i, s in
+               enumerate(assembly_seqs)]
+    SeqIO.write(records, assembly_fasta, 'fasta')
+
+    if len(assembly_seqs) > 1:
+        job.error_message = f"{len(assembly_seqs)} Assembly Options"
 
     add_files(job.data_path('assembly'), *result_folder.iterdir())
     with Session(engine) as session:
@@ -360,6 +383,18 @@ async def transfer_annotations(job: PlasmidSeqRun):
 
 @app.post('/combine', response_model=PlasmidSeqRunList)
 async def combine_results(jobs: PlasmidSeqRunList):
+    runs_by_type = defaultdict(list)
+    for r in jobs.runs:
+        r_type = type(r)
+        runs_by_type[r_type].append(r)
+
+    jobs.runs = runs_by_type[PlasmidSeqRun]
+    for cur_list in runs_by_type[PlasmidSeqRunList]:
+        jobs.runs.extend(cur_list.runs)
+
+    if len(jobs.runs) == 0:
+        raise ValueError("There are no runs to combine data for.")
+
     # Download Result Files
     experiment_id = jobs.runs[0].experiment_id
     result_dir = Path('/tmp') / experiment_id / 'results'

@@ -1,8 +1,15 @@
+from itertools import product
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import boto3
+from gfapy.line.edge import Link
 from nanoid import generate
+
+from gfapy import Gfa
+from networkx import MultiDiGraph
+import networkx.algorithms as nxa
+import pydna.all as pyd
 
 
 def upload_files(*file_paths: Path) -> Optional[str]:
@@ -63,3 +70,44 @@ def add_files(folder: str, *file_paths: Path) -> bool:
         return False
 
     return True
+
+
+def plasmids_from_gfa(gfa_data: Gfa) -> List[pyd.Dseq]:
+    graph = MultiDiGraph()
+    # graph.add_nodes_from(g.segment_names)
+    sequences = {}
+    for n in gfa_data.segment_names:
+        graph.add_edge(f"{n}L", f"{n}R")
+        cur_seq = pyd.Dseq(gfa_data.segment(n).sequence, linear=True)
+        sequences[f"{n}L"] = cur_seq
+        sequences[f"{n}R"] = cur_seq.reverse_complement()
+
+    cur_edge: Link
+    for cur_edge in gfa_data.edges:
+        print(cur_edge.from_end, cur_edge.to_end)
+        graph.add_edge(str(cur_edge.from_end), str(cur_edge.to_end))
+
+    roots = [n for n, d in graph.in_degree if d == 0]
+    leaves = [n for n, d in graph.out_degree if d == 0]
+
+    all_paths = []
+    for cur_root, cur_leaf in product(roots, leaves):
+        for cur_path in list(nxa.all_simple_paths(graph, cur_root, cur_leaf)):
+            if str(cur_path[0])[:-1] != str(cur_path[1])[:-1]:
+                cur_path = [f"{str(cur_path[0])[:-1]}R"] + cur_path
+            if str(cur_path[-1])[:-1] != str(cur_path[-2])[:-1]:
+                cur_path = cur_path + [f"{str(cur_path[-1])[:-1]}L"]
+            print(cur_path)
+            all_paths.append(cur_path)
+
+    full_sequences = []
+    for path in all_paths:
+        # print(path)
+        print(path[::2])
+
+        cur_seq = sequences[path[0]]
+        for frag_start in path[2::2]:
+            cur_seq = cur_seq + sequences[frag_start]
+        full_sequences.append(cur_seq)
+
+    return full_sequences

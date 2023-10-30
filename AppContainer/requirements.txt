@@ -27,3 +27,4 @@ requests_futures
 airium
 aiostream
 aws-lambda-powertools
+gfapy

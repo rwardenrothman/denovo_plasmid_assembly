@@ -341,29 +341,39 @@ def align_sequences(template_file: str, assembly_file: str, codon_table='RC63') 
     """
     # Reading the template (genbank) and assembly (fasta) files
     template_seq_record = SeqIO.read(template_file, "genbank")
-    assembly_seq_record = next(SeqIO.parse(assembly_file, "fasta"))
-    assembly_seq_record_rc = assembly_seq_record.reverse_complement()
-
-    # Extracting sequences and converting to string
     template_seq = str(template_seq_record.seq)
-    assembly_seq = str(assembly_seq_record.seq) * 2
-    assembly_seq_rc = str(assembly_seq_record_rc.seq) * 2
 
-    # Performing the alignment (Using global alignment in this case)
-    alignments = pairwise2.align.globalxs(template_seq, assembly_seq, -2, -.1)
-    alignments_rc = pairwise2.align.globalxs(template_seq, assembly_seq_rc, -2, -.1)
+    assembly_seq_record: Optional[SeqRecord] = None
+    alignments = None
+    best_alignment_score = 0
+    for assembly_seq_record_cur in SeqIO.parse(assembly_file, "fasta"):
+        assembly_seq_record_rc = assembly_seq_record_cur.reverse_complement()
 
-    # Check for a reverse-complement assembly sequence
-    if alignments_rc[0][2] > alignments[0][2]:
-        alignments = alignments_rc
-        assembly_seq_record = assembly_seq_record_rc
-        assembly_seq = assembly_seq_rc
+        # Extracting sequences and converting to string
+        assembly_seq = str(assembly_seq_record_cur.seq) * 2
+        assembly_seq_rc = str(assembly_seq_record_rc.seq) * 2
+
+        # Performing the alignment (Using global alignment in this case)
+        alignments_fwd = pairwise2.align.globalxs(template_seq, assembly_seq, -2, -.1)
+        alignments_rc = pairwise2.align.globalxs(template_seq, assembly_seq_rc, -2, -.1)
+
+        # Check if fwd alignment is best
+        if alignments_fwd[0][2] > best_alignment_score:
+            alignments = alignments_fwd
+            assembly_seq_record = assembly_seq_record_cur
+            best_alignment_score = alignments_fwd[0][2]
+
+        # Check for a reverse-complement assembly sequence
+        if alignments_rc[0][2] > best_alignment_score:
+            alignments = alignments_rc
+            assembly_seq_record = assembly_seq_record_rc
+            best_alignment_score = alignments_rc[0][2]
 
     # Rotate the assembly to match the template
     shift = len(alignments[0][0]) - len(alignments[0][0].lstrip('-'))
     if shift > 0:
-        assembly_seq_record = assembly_seq_record[shift:] + assembly_seq_record[:shift]
-        assembly_seq = str(assembly_seq_record.seq)
+        assembly_seq_record_cur = assembly_seq_record[shift:] + assembly_seq_record[:shift]
+        assembly_seq = str(assembly_seq_record_cur.seq)
 
         # Realign
         alignments = pairwise2.align.globalxs(template_seq, assembly_seq, -2, -.1)
@@ -372,13 +382,13 @@ def align_sequences(template_file: str, assembly_file: str, codon_table='RC63') 
     position_map = map_positions(alignments)
 
     # Propagate annotations from the template sequence to the assembly sequence
-    assembly_seq_record = propagate_annotations(template_seq_record, assembly_seq_record, position_map)
-    assembly_seq_record.annotations.update(dict(topology='circular', molecule_type='DNA', data_file_division='SYN'))
-    assembly_seq_record.name = f"pseq_{template_seq_record.name}"[:16].replace(' ', '_')
+    assembly_seq_record_cur = propagate_annotations(template_seq_record, assembly_seq_record, position_map)
+    assembly_seq_record_cur.annotations.update(dict(topology='circular', molecule_type='DNA', data_file_division='SYN'))
+    assembly_seq_record_cur.name = f"pseq_{template_seq_record.name}"[:16].replace(' ', '_')
 
     # find indels & add to map
     indels = find_indels(position_map)
-    mutations = find_mutated_regions(position_map, template_seq_record, assembly_seq_record)
+    mutations = find_mutated_regions(position_map, template_seq_record, assembly_seq_record_cur)
     differences = indels + mutations
 
     for c_pm in differences:
@@ -391,12 +401,12 @@ def align_sequences(template_file: str, assembly_file: str, codon_table='RC63') 
         new_feature = SeqFeature(FeatureLocation(start_position, end_position), 'Polymorphism',
                                  qualifiers={'Polymorphism Type': [c_pm.mutation_type],
                                              'Change': [c_pm.sequence_change]})
-        assembly_seq_record.features.append(new_feature)
+        assembly_seq_record_cur.features.append(new_feature)
 
     # alter genotypes
-    cds_effects = translate_and_compare(template_seq_record, assembly_seq_record, indels, 'RC63')
+    cds_effects = translate_and_compare(template_seq_record, assembly_seq_record_cur, indels, 'RC63')
     cur_cds: SeqFeature
-    for cur_cds in (f for f in assembly_seq_record.features if f.type == 'CDS'):
+    for cur_cds in (f for f in assembly_seq_record_cur.features if f.type == 'CDS'):
         f_label = cur_cds.qualifiers.get('label', [None])[0]
         if not f_label or f_label not in cds_effects:
             continue
@@ -414,7 +424,7 @@ def align_sequences(template_file: str, assembly_file: str, codon_table='RC63') 
         cds_df_list.append(cur_df)
     cds_df = pd.concat(cds_df_list) if cds_df_list else pd.DataFrame()
 
-    return assembly_seq_record, position_map, mut_df, cds_df
+    return assembly_seq_record_cur, position_map, mut_df, cds_df
 
 
 if __name__ == '__main__':
