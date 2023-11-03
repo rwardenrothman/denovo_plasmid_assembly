@@ -3,8 +3,9 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/venv" />
+      <excludeFolder url="file://$MODULE_DIR$/venv2" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.10.12 WSL (Ubuntu): (/home/rwarden/.virtualenvs/denovo_plasmid_assembly/bin/python)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.11 (denovo_plasmid_assembly)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

@@ -335,7 +335,7 @@ def align_sequences(template_file: str, assembly_file: str, codon_table='RC63') 
 
     Example usage:
         template_file = 'template.gb'
-        assembly_file = 'assembly.fasta'
+        assembly_file = 'c1.fasta'
         codon_table = 'RC63'
         aligned_sequence, position_map, mutation_df, cds_df = align_sequences(template_file, assembly_file, codon_table)
     """

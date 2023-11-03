@@ -9,36 +9,34 @@ RUN wget http://opengene.org/fastp/fastp; chmod a+x ./fastp; mv ./fastp /usr/bin
 # Install Trimmomatic
 COPY Trimmomatic-0.39.zip .
 RUN unzip Trimmomatic-0.39.zip
+ENV PATH "$PATH:/var/task/Trimmomatic-0.39"
 
 # Install SPAdes
 COPY SPAdes-3.15.5-Linux.tar.gz .
 RUN tar zxf SPAdes-3.15.5-Linux.tar.gz
+ENV PATH "$PATH:/var/task/SPAdes-3.15.5-Linux/bin"
 
 # Install Unicycler w/ NCBI dependencies
-COPY sratoolkit.2.10.9-centos_linux64-cloud.tar.gz .
-RUN tar xzf sratoolkit.2.10.9-centos_linux64-cloud.tar.gz -C /
-ENV PATH "$PATH:/usr/local/ncbi/sra-tools/bin"
+RUN yum install -y perl perl-Archive-Tar perl-List-MoreUtils perl-Digest-MD5 libgomp
+COPY "ncbi-blast-2.15.0+-3.x86_64.rpm" .
+RUN  rpm -ivh ncbi-blast-2.15.0+-3.x86_64.rpm
 COPY ./unicycler-0.5.0-py3-none-any.whl unicycler/
 RUN python3 -m pip install unicycler/unicycler-0.5.0-py3-none-any.whl
 
+# Install samtools, bcftools, bowtie, and blast
+COPY samtools.tar.gz .
+RUN tar -xzf samtools.tar.gz -C /usr/local
+COPY bcftools.tar.gz .
+RUN tar -xzf bcftools.tar.gz -C /usr/local
+COPY bowtie2-2.5.2-sra-linux-x86_64.zip .
+RUN unzip bowtie2-2.5.2-sra-linux-x86_64.zip
+ENV PATH "$PATH:/usr/local/samtools/bin:/usr/local/bcftools/bin:/var/task/bowtie2-2.5.2-sra-linux-x86_64"
+
 # Install Foundry Backend
-ARG SPACE_UN
-ARG SPACE_TOKEN
-RUN python3 -m pip install foundrybackend -i https://$SPACE_UN:$SPACE_TOKEN@pypi.pkg.jetbrains.space/grobio-foundry/p/wf-dev/grobio-foundry-pypi/simple
-
-## Install samtools & bcftools
-#COPY samtools.tar.gz .
-#RUN tar -xzf samtools.tar.gz -C /usr/local
-#COPY bcftools.tar.gz .
-#RUN tar -xzf bcftools.tar.gz -C /usr/local
-#
-## Install exonerate
-#COPY exonerate.tar.gz .
-#RUN tar -xzf exonerate.tar.gz -C /usr/local
-
-
-
-# Add locations to PATH
-ENV PATH "$PATH:/usr/local/ncbi/sra-tools/bin:/var/task/Trimmomatic-0.39:/var/task/SPAdes-3.15.5-Linux/bin:/usr/local/samtools/bin:/usr/local/bcftools/bin:/usr/local/exonerate/bin"
+COPY aws-key .
+RUN echo https://aws:$(cat aws-key)@grobio-foundry-409124030547.d.codeartifact.us-east-2.amazonaws.com/pypi/foundry-pypi/simple/
+RUN python3 -m pip config set global.extra-index-url https://aws:$(cat aws-key)@grobio-foundry-409124030547.d.codeartifact.us-east-2.amazonaws.com/pypi/foundry-pypi/simple/
+RUN rm aws-key
+RUN python3 -m pip install foundrybackend
 
 CMD [ "function.handler" ]

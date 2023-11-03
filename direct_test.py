@@ -15,7 +15,7 @@ if __name__ == '__main__':
     for datapoint in datapoints:
         print(datapoint)
 
-        res = asyncio.run(transfer_annotations(datapoint))
+        res = asyncio.run(transfer_annotations(datapoint,,)
         print(res)
         print('')
 

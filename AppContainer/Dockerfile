@@ -1,12 +1,6 @@
-FROM 409124030547.dkr.ecr.us-east-1.amazonaws.com/foundry-plasmidseq-base:2023.09.29.13.39
+FROM 409124030547.dkr.ecr.us-east-1.amazonaws.com/foundry-plasmidseq-base:2023.11.03.15.58
 
 # Install the function's dependencies
-ARG SPACE_UN
-ARG SPACE_TOKEN
-RUN pip3 install geneiousdb -i https://$SPACE_UN:$SPACE_TOKEN@pypi.pkg.jetbrains.space/grobio-foundry/p/wf-dev/grobio-foundry-pypi/simple
-RUN pip3 install grobiosimplegui -i https://$SPACE_UN:$SPACE_TOKEN@pypi.pkg.jetbrains.space/grobio-foundry/p/wf-dev/grobio-foundry-pypi/simple
-RUN pip3 install aiohttp pandas pydantic requests
-RUN pip3 install idtscitoolsapi -i https://$SPACE_UN:$SPACE_TOKEN@pypi.pkg.jetbrains.space/grobio-foundry/p/wf-dev/grobio-foundry-pypi/simple
 COPY requirements.txt .
 RUN pip3 install -r requirements.txt --target "${LAMBDA_TASK_ROOT}" -U --no-cache-dir
 

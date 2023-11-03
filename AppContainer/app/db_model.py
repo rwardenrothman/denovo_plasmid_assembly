@@ -33,11 +33,15 @@ class PlasmidSeqRun(LambdaMixin, table=True):
 
     assemblies: List["PlasmidSeqAssembly"] = Relationship(back_populates='sample')
 
-    def data_path(self, folder: str = None) -> str:
+    def data_path(self, *folders: str) -> str:
         path = f"{self.experiment_id}/{self.data_id}"
-        if folder:
+        for folder in folders:
             path += '/' + folder
         return path
+
+    @property
+    def template_gb(self) -> str:
+        return f"{self.template_name}.gb"
 
 
 class PlasmidSeqAssembly(SQLModel, table=True):
@@ -46,10 +50,19 @@ class PlasmidSeqAssembly(SQLModel, table=True):
     assembly_name: str
     contig_path: str
     length: int
+    min_prevalence: float
 
     sample: PlasmidSeqRun = Relationship(back_populates='assemblies')
     features: List["AssemblyFeature"] = Relationship(back_populates='assembly')
     polymorphisms: List["AssemblyPolymorphism"] = Relationship(back_populates='assembly')
+
+    @property
+    def assembly_gb(self) -> str:
+        return f"{self.assembly_name}.gb"
+
+
+class AssemblyList(LambdaMixin):
+    assemblies: List[PlasmidSeqAssembly]
 
 
 class FeaturePolymorphism(SQLModel, table=True):
@@ -79,7 +92,7 @@ class AssemblyPolymorphism(SQLModel, table=True):
     assembly_nt_end: int
     cds_effect: Optional[str]
 
-    assembly: PlasmidSeqAssembly = Relationship(back_populates='features')
+    assembly: PlasmidSeqAssembly = Relationship(back_populates='polymorphisms')
     features: List["AssemblyFeature"] = Relationship(back_populates='polymorphisms', link_model=FeaturePolymorphism)
 
 

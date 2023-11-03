@@ -58,7 +58,7 @@ FASTP_MIN_LENGTH = 150
 UNICYCLER_LOG = 'run_unicycler.log'
 UNICYCLER_ASSEMBLY = 'assembly.fasta'
 FINAL_ASSEMBLY = 'final_assembly.fasta'
-UNICYCLER_OPTIONS = '--keep 0 --no_rotate'
+UNICYCLER_OPTIONS = '--keep 3 --no_rotate'
 
 # CDF estimated from bootstrapped combinations of 'primary' and 'contaminant' sequences with contaminant
 # proportions ranging from 5% to 50% of total reads.  For assemblies with a single sequence, reads were compared

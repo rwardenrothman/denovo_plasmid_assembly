@@ -3,7 +3,7 @@ import traceback, json
 from itertools import product
 from pathlib import Path
 from subprocess import TimeoutExpired
-from typing import Optional, List, Any, Callable
+from typing import Optional, List, Any, Callable, TypeAlias, Annotated
 from zipfile import ZipFile
 
 import boto3
@@ -11,13 +11,14 @@ import pandas as pd
 import uvicorn
 import pydna.all as pyd
 from Bio.Seq import Seq
+from Bio.SeqFeature import SeqFeature
 from Bio.SeqRecord import SeqRecord
-from fastapi import FastAPI, Response, Request, HTTPException
+from fastapi import FastAPI, Response, Request, HTTPException, Depends
 from fastapi.routing import APIRoute
 from fastapi.responses import FileResponse, JSONResponse
 from gfapy import Gfa
 from mangum import Mangum
-from mangum.types import LambdaEvent
+from mypy_boto3_s3.service_resource import Bucket
 from sqlmodel import Session, select
 from starlette.middleware.exceptions import ExceptionMiddleware
 from aws_lambda_powertools import Logger
@@ -27,15 +28,27 @@ if 'AppContainer' in __file__:
     from .helpers import add_files, plasmids_from_gfa
     from .annotation_propagation import align_sequences
     from .basespace import basespace_get
-    from .db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList
+    from .db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList, \
+    PlasmidSeqAssembly
 else:
     from denovo_from_paper import *
     from helpers import add_files, plasmids_from_gfa
     from annotation_propagation import align_sequences
     from basespace import basespace_get
-    from db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList
+    from db_model import (make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList,
+                          PlasmidSeqAssembly)
 
 from Bio import SeqIO
+
+
+# Folder constants
+class S3Folders:
+    RAW_FASTQ: str = 'raw_fastq'
+    TEMPLATE: str = 'template'
+    TRIMMED_FASTQ: str = 'trimmed_fastq'
+    ASSEMBLY: str = 'assembly'
+    PLASMIDS: str = 'assembly_plasmids'
+    RESULTS: str = 'results'
 
 
 class LoggerRouteHandler(APIRoute):
@@ -72,6 +85,26 @@ logger: Logger = Logger(log_uncaught_exceptions=True)
 engine = make_engine()
 
 
+async def get_session() -> Session:
+    new_session = Session(engine)
+    try:
+        yield new_session
+    finally:
+        new_session.close()
+
+
+DSession: TypeAlias = Annotated[Session, Depends(get_session)]
+
+
+async def pseq_bucket() -> Bucket:
+    s3 = boto3.resource('s3', region_name='us-east-1')
+    bucket_resource: Bucket = s3.Bucket('foundry-plasmid-seq')
+    return bucket_resource
+
+
+S3Bucket: TypeAlias = Annotated[Bucket, Depends(pseq_bucket)]
+
+
 def set_last_step(session: Session, job_data: PlasmidSeqRun, step_name: str) -> PlasmidSeqRun:
     existing_data = session.get(PlasmidSeqRun, job_data.id)
 
@@ -87,6 +120,25 @@ def set_last_step(session: Session, job_data: PlasmidSeqRun, step_name: str) -> 
     session.commit()
     session.refresh(job_data)
     return job_data
+
+
+class WrongStateException(ValueError):
+    def __init__(self, expected_status: str, job: PlasmidSeqRun, *args):
+        self.expected_status = expected_status
+        self.job = job
+        super().__init__(*args)
+
+    @staticmethod
+    def check_job(job: PlasmidSeqRun, *allowed_statuses: str):
+        if job.last_step not in allowed_statuses:
+            raise WrongStateException(allowed_statuses[0] if len(allowed_statuses) == 1 else str(allowed_statuses), job)
+
+
+@app.exception_handler(WrongStateException)
+async def handle_wrong_state_exception(request: Request, err: WrongStateException):
+    info_string = f"Job {err.job.data_path()} was in state {err.job.last_step}, {err.expected_status} was expected"
+    logger.info(info_string)
+    return JSONResponse(status_code=521, content=dict(detail=info_string))
 
 
 @app.exception_handler(Exception)
@@ -245,27 +297,24 @@ async def assembly_status(job: PlasmidSeqRun, from_state: str, to_state: str):
 
 
 @app.post('/assemble', response_model=PlasmidSeqRun)
-async def assemble(job: PlasmidSeqRun):
+async def assemble(job: PlasmidSeqRun, session: DSession, bucket: S3Bucket):
     if job.last_step != 'Trim':
         return job
 
-    # copy files to the temp folder
+    # copy fastq files to the temp folder
     tmp_folder = Path('/tmp') / job.data_path('assemble_step')
     result_folder = tmp_folder / 'assembly'
     tmp_folder.mkdir(exist_ok=True, parents=True)
 
-    s3 = boto3.resource('s3', region_name='us-east-1')
-    bucket_resource = s3.Bucket('foundry-plasmid-seq')
-
     r1_file: Optional[Path] = None
     r2_file: Optional[Path] = None
 
-    for obj in bucket_resource.objects.filter(Prefix=job.data_path('trimmed_fastq')):
+    for obj in bucket.objects.filter(Prefix=job.data_path(S3Folders.TRIMMED_FASTQ)):
         # Define the local path for the file
         target = tmp_folder / Path(obj.key).name
 
         # Download the file from S3 to the target path
-        bucket_resource.download_file(obj.key, str(target))
+        bucket.download_file(obj.key, str(target))
 
         # Set the r1 or r2 file
         if '_R1_' in target.name:
@@ -276,69 +325,160 @@ async def assemble(job: PlasmidSeqRun):
     assert r1_file is not None
     assert r2_file is not None
 
-    # queries, max_readlen = load_queries([r1_file, r2_file])
+    # read in the template to find the rep origin
+    template_file = tmp_folder / job.template_gb
+    ori_file = tmp_folder / 'ori.fasta'
+
+    bucket.download_file(job.data_path(S3Folders.TEMPLATE, job.template_gb), template_file.as_posix())
+    template_record: SeqRecord = SeqIO.read(template_file.as_posix(), 'gb')
+
+    cur_feature: SeqFeature
+    for cur_feature in template_record.features:
+        if cur_feature.type == 'rep_origin':
+            f_name = cur_feature.qualifiers.get('label', ['origin'])[0]
+            cur_feature.location.strand = 1
+            f_seq = str(cur_feature.extract(template_record.seq)).upper()
+            ori_file.write_text(f">{f_name}\n{f_seq}")
+            unicycler_rotation_opts = ['--start_genes', ori_file.as_posix()]
+            break
+    else:
+        unicycler_rotation_opts = ['--no_rotate']
+
+    # run unicycler
+    unicycler_debug = True
+    unicycler_command = ['unicycler',
+                         '-1', r1_file.as_posix(),
+                         '-2', r2_file.as_posix(),
+                         '-o', result_folder.as_posix(),
+                         '--keep', str(3 if unicycler_debug else 1)]
+    unicycler_command.extend(unicycler_rotation_opts)
 
     try:
-        assembly_fasta = denovo_assembly(r1_file, r2_file, result_folder, verbose=True)
+        run_command(unicycler_command)
+        assembly_fasta = result_folder / 'assembly.fasta'
+        assert assembly_fasta.is_file()
     except OSError as ose:
         raise ose
+    except AssertionError:
+        raise FileNotFoundError(f'{job.data_path()} did not result in an assembly file.')
     except TimeoutExpired:
         raise TimeoutError(f'{job.data_path()} could not be assembled in 14 min.')
 
-    validate_file(assembly_fasta)
+    add_files(job.data_path(S3Folders.ASSEMBLY), *result_folder.iterdir())
 
-    assembly_gfa = Gfa.from_file(assembly_fasta.replace('.fasta', '.gfa'))
-    assembly_seqs = plasmids_from_gfa(assembly_gfa)
-    records = [pyd.Dseqrecord(s, id=f"Component_{i + 1}", circular=True) for i, s in
-               enumerate(assembly_seqs)]
-    SeqIO.write(records, assembly_fasta, 'fasta')
-
-    if len(assembly_seqs) > 1:
-        job.error_message = f"{len(assembly_seqs)} Assembly Options"
-
-    add_files(job.data_path('assembly'), *result_folder.iterdir())
-    with Session(engine) as session:
-        job = set_last_step(session, job, 'Assemble')
-    return job
+    return set_last_step(session, job, 'Assemble')
 
 
-@app.post('/transfer_annotations', response_model=PlasmidSeqRun)
-async def transfer_annotations(job: PlasmidSeqRun):
+@app.post('/make_plasmids', response_model=AssemblyList)
+async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket):
     if job.last_step != 'Assemble':
-        return job
+        return JSONResponse(status_code=521, content={'detail': f'Job {job.data_path()} is not in the correct state'})
 
-    temp_dir = Path('/tmp') / job.data_path('analysis_step')
+    # copy files to the temp folder
+    tmp_folder = Path('/tmp') / job.data_path('make_plasmid_step')
+    tmp_folder.mkdir(exist_ok=True, parents=True)
+
+    # Download the assembly graph
+    logger.info('Reading assembly graph')
+    graph_path = tmp_folder / 'assembly.gfa'
+    bucket_resource.download_file(job.data_path('assembly/assembly.gfa'), graph_path.as_posix())
+    assembly_graph = Gfa.from_file(graph_path.as_posix())
+
+    # Build out sequences
+    logger.info(f'Generating plasmid sequences from {str(assembly_graph)}')
+    seq_info = plasmids_from_gfa(assembly_graph)
+    logger.info(f'{len(seq_info):d} valid paths were found. {str([i[1] for i in seq_info])}')
+
+    # Download the template plasmid
+    logger.info('Determining sequence directionality')
+    template_path = tmp_folder / f'{job.template_name}.gb'
+    bucket_resource.download_file(job.data_path(f'template/{job.template_name}.gb'), template_path.as_posix())
+    template_seq: pyd.Dseqrecord = pyd.read(template_path.as_posix())
+
+    # Determine if the sequences need to be reverse complemented
+    temp_fwd_fragments: list[pyd.Dseq] = [template_seq.seq[i+1:i+10] for i in range(0, 51, 10)]
+    temp_rev_fragments: list[pyd.Dseq] = [s.reverse_complement() for s in temp_fwd_fragments]
+
+    fwd_match_counts = sum(sum(t_frag in p for p, *_ in seq_info) for t_frag in temp_fwd_fragments)
+    rev_match_counts = sum(sum(t_frag in p for p, *_ in seq_info) for t_frag in temp_rev_fragments)
+
+    if fwd_match_counts > rev_match_counts:
+        needs_rc = False
+    elif rev_match_counts > fwd_match_counts:
+        needs_rc = True
+    elif fwd_match_counts == rev_match_counts:
+        needs_rc = False  # May need to implement more logic here
+    else:
+        needs_rc = False  # Catch all for linting
+
+    # Create Sequence Records
+    logger.info('Creating the assembly items')
+    assembly_folder = tmp_folder / 'assemblies'
+    assembly_folder.mkdir(exist_ok=True)
+
+    assy_list = []
+    all_records = []
+    i = 0
+    with Session(engine) as session:
+        # Clear previous assemblies for this job
+        job = session.get(PlasmidSeqRun, job.id)
+        prev_assemblies = session.query(PlasmidSeqAssembly).where(PlasmidSeqAssembly.run_id == job.id).all()
+        for pa in prev_assemblies:
+            session.delete(pa)
+
+        for seq, path, prevalence in seq_info:
+            i += 1
+            cur_assy_obj = PlasmidSeqAssembly()
+            cur_assy_obj.sample = job
+            cur_assy_obj.assembly_name = f"{job.data_id}.{i:d}"
+            cur_assy_obj.contig_path = path
+            cur_assy_obj.length = len(seq)
+            cur_assy_obj.min_prevalence = prevalence
+
+            session.add(cur_assy_obj)
+            session.commit()
+            assy_list.append(cur_assy_obj)
+            logger.info(f"Added {cur_assy_obj.assembly_name} to database, id={cur_assy_obj.id:d}")
+
+            record_seq = seq.reverse_complement() if needs_rc else seq
+            cur_record = pyd.Dseqrecord(record_seq, name=cur_assy_obj.assembly_name, circular=True,
+                                        description=f'De novo assembly of {job.data_id}, path {i:d}')
+            cur_record.write((assembly_folder / f"{cur_assy_obj.assembly_name}.gb").as_posix())
+            all_records.append(cur_record)
+
+        set_last_step(session, job, 'Split')
+        for pa in assy_list:
+            session.refresh(pa)
+
+    # Upload Assembly Files
+    logger.info(f"Uploading {len(seq_info):d} plasmid maps to S3")
+    SeqIO.write(all_records, assembly_folder / 'plasmids.fa', 'fasta')
+    add_files(job.data_path('assembly_plasmids'), *assembly_folder.iterdir())
+
+    return_obj = AssemblyList(assemblies=assy_list)
+    logger.info(return_obj.json())
+    return return_obj
+
+
+@app.post('/transfer_annotations', response_model=PlasmidSeqAssembly)
+async def transfer_annotations(assembly_obj: PlasmidSeqAssembly, bucket: S3Bucket, session: DSession):
+    session.refresh(assembly_obj)
+    job = assembly_obj.sample
+
+    temp_dir = Path('/tmp') / job.data_path('analysis_step') / assembly_obj.assembly_name
     out_dir = temp_dir / 'outputs'
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    s3 = boto3.resource('s3', region_name='us-east-1')
-    bucket_resource = s3.Bucket('foundry-plasmid-seq')
+    # Download template & assembly genbanks
+    template_file = temp_dir / f"{job.template_name}.gb"
+    bucket.download_file(job.data_path('template', job.template_name + '.gb'), template_file.as_posix())
 
-    # Download template genbank
-    for obj in bucket_resource.objects.filter(Prefix=job.data_path('template')):
-        # Define the local path for the file
-        target = temp_dir / Path(obj.key).name
+    assembly_file = temp_dir / f"{assembly_obj.assembly_name}.gb"
+    bucket.download_file(job.data_path('assembly_plasmids', assembly_file.name), assembly_file.as_posix())
 
-        # Download the file from S3 to the target path
-        if '.gb' in target.suffix:
-            initial_file = target
-            logger.info(f"Writing template to {initial_file.as_posix()}")
-            bucket_resource.download_file(obj.key, str(target))
-            break
-    else:
-        raise FileNotFoundError(f"Could not find a genbank file for template {job.template_name}.")
-
-    # Download Assembly Files
-    for obj in bucket_resource.objects.filter(Prefix=job.data_path('assembly')):
-        # Define the local path for the file
-        target = temp_dir / Path(obj.key).name
-
-        # Download the file from S3 to the target path
-        bucket_resource.download_file(obj.key, str(target))
-
-    template_record: SeqRecord = SeqIO.read(str(initial_file), "genbank")
-    annotated_assembly, position_map, mut_df, cds_df = align_sequences(str(initial_file),
-                                                                       str(temp_dir / 'assembly.fasta'))
+    template_record: SeqRecord = SeqIO.read(str(template_file), "genbank")
+    annotated_assembly, position_map, mut_df, cds_df = align_sequences(template_file.as_posix(),
+                                                                       assembly_file.as_posix())
 
     assembly_file = out_dir / f'{job.data_id}.gbk'
     SeqIO.write([annotated_assembly], str(assembly_file), 'genbank')
@@ -376,8 +516,6 @@ async def transfer_annotations(job: PlasmidSeqRun):
     SeqIO.write([annotated_assembly], str(wt_like_assembly_gbk), 'genbank')
     add_files(job.data_path('results/sequences'), wt_like_assembly_gbk, assembly_file)
 
-    with Session(engine) as session:
-        job = set_last_step(session, job, 'Analysis')
     return job
 
 
