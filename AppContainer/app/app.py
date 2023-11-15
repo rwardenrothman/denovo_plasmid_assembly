@@ -1,19 +1,17 @@
 from collections import defaultdict
-import traceback, json
-from itertools import product
 from pathlib import Path
 from subprocess import TimeoutExpired
-from typing import Optional, List, Any, Callable, TypeAlias, Annotated
+from typing import Optional, List, Callable, TypeAlias, Annotated
 from zipfile import ZipFile
 
 import boto3
 import pandas as pd
 import uvicorn
 import pydna.all as pyd
-from Bio.Seq import Seq
 from Bio.SeqFeature import SeqFeature
 from Bio.SeqRecord import SeqRecord
-from fastapi import FastAPI, Response, Request, HTTPException, Depends
+from botocore.exceptions import ClientError
+from fastapi import FastAPI, Response, Request, Depends
 from fastapi.routing import APIRoute
 from fastapi.responses import FileResponse, JSONResponse
 from gfapy import Gfa
@@ -26,17 +24,20 @@ from aws_lambda_powertools import Logger
 if 'AppContainer' in __file__:
     from .denovo_from_paper import *
     from .helpers import add_files, plasmids_from_gfa
-    from .annotation_propagation import align_sequences
+    from .assembly_analysis import assembly_analysis_pipeline, AssemblyTooShortError
     from .basespace import basespace_get
     from .db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList, \
-    PlasmidSeqAssembly
+        PlasmidSeqAssembly
+
+    PRODUCTION = False
 else:
     from denovo_from_paper import *
     from helpers import add_files, plasmids_from_gfa
-    from annotation_propagation import align_sequences
+    from assembly_analysis import assembly_analysis_pipeline
     from basespace import basespace_get
     from db_model import (make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList,
                           PlasmidSeqAssembly)
+    PRODUCTION = True
 
 from Bio import SeqIO
 
@@ -49,6 +50,7 @@ class S3Folders:
     ASSEMBLY: str = 'assembly'
     PLASMIDS: str = 'assembly_plasmids'
     RESULTS: str = 'results'
+    RESULT_SEQS: str = f'{RESULTS}/sequences'
 
 
 class LoggerRouteHandler(APIRoute):
@@ -139,6 +141,13 @@ async def handle_wrong_state_exception(request: Request, err: WrongStateExceptio
     info_string = f"Job {err.job.data_path()} was in state {err.job.last_step}, {err.expected_status} was expected"
     logger.info(info_string)
     return JSONResponse(status_code=521, content=dict(detail=info_string))
+
+
+@app.exception_handler(AssemblyTooShortError)
+async def handle_too_short_error(request: Request, err: AssemblyTooShortError):
+    info_string = ', '.join(err.args)
+    logger.info(info_string)
+    return JSONResponse(status_code=538, content=dict(detail=info_string))
 
 
 @app.exception_handler(Exception)
@@ -347,15 +356,16 @@ async def assemble(job: PlasmidSeqRun, session: DSession, bucket: S3Bucket):
     # run unicycler
     unicycler_debug = True
     unicycler_command = ['unicycler',
-                         '-1', r1_file.as_posix(),
-                         '-2', r2_file.as_posix(),
-                         '-o', result_folder.as_posix(),
+                         '-1', str(r1_file),
+                         '-2', str(r2_file),
+                         '-o', str(result_folder),
                          '--keep', str(3 if unicycler_debug else 1)]
     unicycler_command.extend(unicycler_rotation_opts)
 
     try:
-        run_command(unicycler_command)
+        run_command(' '.join(unicycler_command))
         assembly_fasta = result_folder / 'assembly.fasta'
+        add_files(job.data_path(S3Folders.ASSEMBLY), *result_folder.iterdir())
         assert assembly_fasta.is_file()
     except OSError as ose:
         raise ose
@@ -364,15 +374,14 @@ async def assemble(job: PlasmidSeqRun, session: DSession, bucket: S3Bucket):
     except TimeoutExpired:
         raise TimeoutError(f'{job.data_path()} could not be assembled in 14 min.')
 
-    add_files(job.data_path(S3Folders.ASSEMBLY), *result_folder.iterdir())
-
     return set_last_step(session, job, 'Assemble')
 
 
 @app.post('/make_plasmids', response_model=AssemblyList)
-async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket):
+async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket, session: DSession):
+    job = session.get(PlasmidSeqRun, job.id)
     if job.last_step != 'Assemble':
-        return JSONResponse(status_code=521, content={'detail': f'Job {job.data_path()} is not in the correct state'})
+        return AssemblyList(assemblies=job.assemblies)
 
     # copy files to the temp folder
     tmp_folder = Path('/tmp') / job.data_path('make_plasmid_step')
@@ -387,6 +396,8 @@ async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket):
     # Build out sequences
     logger.info(f'Generating plasmid sequences from {str(assembly_graph)}')
     seq_info = plasmids_from_gfa(assembly_graph)
+    if len(seq_info) == 0:
+        raise ValueError(f'No plasmid sequences were generated from the GFA for {job.data_path()}')
     logger.info(f'{len(seq_info):d} valid paths were found. {str([i[1] for i in seq_info])}')
 
     # Download the template plasmid
@@ -396,7 +407,7 @@ async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket):
     template_seq: pyd.Dseqrecord = pyd.read(template_path.as_posix())
 
     # Determine if the sequences need to be reverse complemented
-    temp_fwd_fragments: list[pyd.Dseq] = [template_seq.seq[i+1:i+10] for i in range(0, 51, 10)]
+    temp_fwd_fragments: list[pyd.Dseq] = [template_seq.seq[i + 1:i + 10] for i in range(0, 51, 10)]
     temp_rev_fragments: list[pyd.Dseq] = [s.reverse_complement() for s in temp_fwd_fragments]
 
     fwd_match_counts = sum(sum(t_frag in p for p, *_ in seq_info) for t_frag in temp_fwd_fragments)
@@ -419,36 +430,42 @@ async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket):
     assy_list = []
     all_records = []
     i = 0
-    with Session(engine) as session:
-        # Clear previous assemblies for this job
-        job = session.get(PlasmidSeqRun, job.id)
-        prev_assemblies = session.query(PlasmidSeqAssembly).where(PlasmidSeqAssembly.run_id == job.id).all()
-        for pa in prev_assemblies:
-            session.delete(pa)
 
-        for seq, path, prevalence in seq_info:
-            i += 1
-            cur_assy_obj = PlasmidSeqAssembly()
-            cur_assy_obj.sample = job
-            cur_assy_obj.assembly_name = f"{job.data_id}.{i:d}"
-            cur_assy_obj.contig_path = path
-            cur_assy_obj.length = len(seq)
-            cur_assy_obj.min_prevalence = prevalence
+    # Clear previous assemblies for this job
+    prev_assemblies = session.query(PlasmidSeqAssembly).where(PlasmidSeqAssembly.run_id == job.id).all()
+    pa: PlasmidSeqAssembly
+    for pa in prev_assemblies:
+        for ob in pa.features + pa.polymorphisms:
+            session.delete(ob)
+        session.delete(pa)
 
-            session.add(cur_assy_obj)
-            session.commit()
-            assy_list.append(cur_assy_obj)
-            logger.info(f"Added {cur_assy_obj.assembly_name} to database, id={cur_assy_obj.id:d}")
+    for seq, path, prevalence in seq_info:
+        i += 1
+        cur_assy_obj = PlasmidSeqAssembly()
+        cur_assy_obj.sample = job
+        cur_assy_obj.assembly_name = f"{job.data_id}.{i:d}"
+        cur_assy_obj.contig_path = path
+        cur_assy_obj.length = len(seq)
+        cur_assy_obj.min_prevalence = prevalence
 
-            record_seq = seq.reverse_complement() if needs_rc else seq
-            cur_record = pyd.Dseqrecord(record_seq, name=cur_assy_obj.assembly_name, circular=True,
-                                        description=f'De novo assembly of {job.data_id}, path {i:d}')
-            cur_record.write((assembly_folder / f"{cur_assy_obj.assembly_name}.gb").as_posix())
-            all_records.append(cur_record)
+        session.add(cur_assy_obj)
+        session.commit()
+        assy_list.append(cur_assy_obj)
+        logger.info(f"Added {cur_assy_obj.assembly_name} to database, id={cur_assy_obj.id:d}")
 
-        set_last_step(session, job, 'Split')
-        for pa in assy_list:
-            session.refresh(pa)
+        record_seq = seq.reverse_complement() if needs_rc else seq
+        cur_record = pyd.Dseqrecord(record_seq, name=cur_assy_obj.assembly_name, circular=True,
+                                    description=f'De novo assembly of {job.data_id}, path {i:d}')
+        cur_record.write((assembly_folder / f"{cur_assy_obj.assembly_name}.gb").as_posix())
+        all_records.append(cur_record)
+
+    job = set_last_step(session, job, 'Split')
+    job.assembly_count = len(assy_list)
+    job.template_length = len(template_seq)
+    session.add(job)
+    session.commit()
+    for pa in assy_list:
+        session.refresh(pa)
 
     # Upload Assembly Files
     logger.info(f"Uploading {len(seq_info):d} plasmid maps to S3")
@@ -460,9 +477,9 @@ async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket):
     return return_obj
 
 
-@app.post('/transfer_annotations', response_model=PlasmidSeqAssembly)
+@app.post('/transfer_annotations', response_model=PlasmidSeqRun)
 async def transfer_annotations(assembly_obj: PlasmidSeqAssembly, bucket: S3Bucket, session: DSession):
-    session.refresh(assembly_obj)
+    assembly_obj = session.get(PlasmidSeqAssembly, assembly_obj.id)
     job = assembly_obj.sample
 
     temp_dir = Path('/tmp') / job.data_path('analysis_step') / assembly_obj.assembly_name
@@ -476,107 +493,101 @@ async def transfer_annotations(assembly_obj: PlasmidSeqAssembly, bucket: S3Bucke
     assembly_file = temp_dir / f"{assembly_obj.assembly_name}.gb"
     bucket.download_file(job.data_path('assembly_plasmids', assembly_file.name), assembly_file.as_posix())
 
-    template_record: SeqRecord = SeqIO.read(str(template_file), "genbank")
-    annotated_assembly, position_map, mut_df, cds_df = align_sequences(template_file.as_posix(),
-                                                                       assembly_file.as_posix())
+    assembly_record = assembly_analysis_pipeline(template_file, assembly_file, assembly_obj, session)
+    assembly_file = out_dir / assembly_obj.assembly_gb
+    SeqIO.write([assembly_record], str(assembly_file), 'genbank')
 
-    assembly_file = out_dir / f'{job.data_id}.gbk'
-    SeqIO.write([annotated_assembly], str(assembly_file), 'genbank')
+    add_files(job.data_path(S3Folders.RESULT_SEQS), assembly_file)
 
-    cds_list = []
-    for cur_cds in (f for f in annotated_assembly.features if f.type == 'CDS'):
-        cds_list.append({
-            'Template': template_record.name,
-            'Template CDS': cur_cds.qualifiers.get('template_label',
-                                                   cur_cds.qualifiers.get('label', ['Unlabeled CDS']))[0],
-            'Assembly CDS': cur_cds.qualifiers.get('label', ['Unlabeled CDS'])[0]
-        })
-    cds_summary = pd.DataFrame(cds_list).pivot(index='Template', columns='Template CDS', values='Assembly CDS')
-    mut_df['Template'] = template_record.name
-    cds_df['Template'] = template_record.name
-
-    results_xlsx = out_dir / f'{template_record.name}_results.xlsx'
-    with pd.ExcelWriter(results_xlsx) as xlsx:
-        cds_summary.to_excel(xlsx, 'CDS Summary')
-        mut_df.set_index('Template').to_excel(xlsx, 'Polymorphisms')
-        cds_df.set_index('Template').to_excel(xlsx, 'CDS Changes')
-
-    add_files(job.data_path('results/data'), results_xlsx)
-
-    t_seq_list = list(str(template_record.seq))
-    a_seq_list = list(str(annotated_assembly.seq))
-
-    for t, a in position_map.items():
-        a_seq_list[a] = t_seq_list[t]
-
-    wt_like_sequence = ''.join(a_seq_list)
-    annotated_assembly.seq = Seq(wt_like_sequence)
-
-    wt_like_assembly_gbk = out_dir / f'{job.template_name}_with_{job.data_id}_indels.gbk'
-    SeqIO.write([annotated_assembly], str(wt_like_assembly_gbk), 'genbank')
-    add_files(job.data_path('results/sequences'), wt_like_assembly_gbk, assembly_file)
-
+    job = set_last_step(session, job, 'Analysis')
     return job
 
 
 @app.post('/combine', response_model=PlasmidSeqRunList)
-async def combine_results(jobs: PlasmidSeqRunList):
-    runs_by_type = defaultdict(list)
-    for r in jobs.runs:
-        r_type = type(r)
-        runs_by_type[r_type].append(r)
+async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DSession):
+    job_runs = jobs.runs_of_type(PlasmidSeqRun)
 
-    jobs.runs = runs_by_type[PlasmidSeqRun]
-    for cur_list in runs_by_type[PlasmidSeqRunList]:
-        jobs.runs.extend(cur_list.runs)
-
-    if len(jobs.runs) == 0:
+    if len(job_runs) == 0:
         raise ValueError("There are no runs to combine data for.")
 
-    # Download Result Files
-    experiment_id = jobs.runs[0].experiment_id
+    zipfiles: defaultdict[str, list[Path]] = defaultdict(list)
+
+    # Download Genbank Files
+    experiment_id = job_runs[0].experiment_id
     result_dir = Path('/tmp') / experiment_id / 'results'
     temp_dir = result_dir / 'full'
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    s3 = boto3.resource('s3', region_name='us-east-1')
-    bucket_resource = s3.Bucket('foundry-plasmid-seq')
+    assembly_data_dicts = []
+    feature_data_dicts = []
+    poly_data_dicts = []
+    error_dicts = []
+    all_experiment_runs: List[PlasmidSeqRun] = (session.query(PlasmidSeqRun)
+                                                .where(PlasmidSeqRun.experiment_id == experiment_id).all())
+    for cur_job in all_experiment_runs:
+        # cur_job = session.get(PlasmidSeqRun, cur_job.id)
+        if cur_job.last_step == 'Error':
+            error_dicts.append(cur_job.dict(exclude=dict(id=True, last_step=True, basespace_href=True,
+                                                         assembly_count=True)))
+            continue
 
-    for job in jobs.runs:
-        for obj in bucket_resource.objects.filter(Prefix=job.data_path('results')):
-            # Define the local path for the file
-            target = temp_dir / Path(obj.key).name
+        cur_job_dict = dict(template=cur_job.template_name, sample=cur_job.data_id,
+                            assembly_count=cur_job.assembly_count, expected_bp=cur_job.template_length)
+        logger.info(cur_job_dict)
+        for cur_assembly in cur_job.assemblies:
+            logger.info(f'Gathering information on {cur_assembly.assembly_name}')
+            cur_gb_file = temp_dir / cur_assembly.assembly_gb
+            gb_file_path = cur_job.data_path(S3Folders.RESULT_SEQS, cur_assembly.assembly_gb)
+            try:
+                bucket.download_file(gb_file_path, cur_gb_file.as_posix())
+            except ClientError:
+                if cur_assembly.length < cur_job.template_length/2:
+                    error_dicts.append(dict(data_id=cur_job.data_id, template_name=cur_job.template_name,
+                                            error_type='ValueError', error_path='/transfer_annotations',
+                                            error_message=f"{cur_assembly.assembly_name} is too short to properly align"
+                                                          f" bp:{cur_assembly.length:d}, "
+                                                          f"expected:{cur_job.template_length}"))
+                logger.warning(f'Could not find {gb_file_path} on S3. Retrying.')
+                try:
+                    bucket.download_file(gb_file_path, cur_gb_file.as_posix())
+                except ClientError:
+                    error_dicts.append(dict(data_id=cur_job.data_id, template_name=cur_job.template_name,
+                                            error_type='ClientError', error_path='/combine',
+                                            error_message=f"The genbank file for {cur_assembly.assembly_name} was not "
+                                                          f"found on S3"))
+                    continue
+            zipfiles['genbanks'].append(cur_gb_file)
 
-            # Download the file from S3 to the target path
-            logger.info(f'Downloading {target.name}')
-            bucket_resource.download_file(obj.key, str(target))
+            cur_assembly_dict = cur_assembly.dict(exclude=dict(id=True, run_id=True))
+            assembly_name_dict = {'assembly': cur_assembly_dict.pop('assembly_name')}
+            cur_assembly_dict['polymorphism_count'] = 0
 
-    # Divide them by type
-    zipfiles = {'genbanks': [], 'wt_like': [], 'data': [], 'other': []}
-    for cur_file in temp_dir.iterdir():
-        if '_indels.gbk' in cur_file.name:
-            zipfiles['wt_like'].append(cur_file)
-        elif cur_file.suffix == '.gbk':
-            zipfiles['genbanks'].append(cur_file)
-        elif cur_file.suffix == '.xlsx':
-            zipfiles['data'].append(cur_file)
-        else:
-            zipfiles['other'].append(cur_file)
+            cur_feature_mods = []
+            for cur_feature in cur_assembly.features:
+                cur_feature_dict = cur_feature.dict(exclude=dict(id=True, assembly_id=True))
+                cur_feature_dict['modified'] = (cur_feature.wt_feature_name != cur_feature.assembly_feature_name
+                                                or cur_feature.deleted)
+                if cur_feature_dict['modified']:
+                    cur_feature_mods.append(cur_feature.assembly_feature_name)
+                feature_data_dicts.append({**cur_job_dict, **assembly_name_dict, **cur_feature_dict})
+            cur_assembly_dict['modified_features'] = ', '.join(cur_feature_mods)
 
-    # combine the data files
-    logger.info('Combining Data Files')
-    sheet_names = ['CDS Summary', 'Polymorphisms', 'CDS Changes']
-    dataframes = defaultdict(list)
-    for cur_sheet, cur_file in product(sheet_names, zipfiles['data']):
-        cur_data = pd.read_excel(cur_file, cur_sheet)
-        dataframes[cur_sheet].append(cur_data)
+            for cur_poly in cur_assembly.polymorphisms:
+                cur_poly_dict = cur_poly.dict(exclude=dict(id=True, assembly_id=True))
+                cur_poly_dict['features'] = ', '.join(f.wt_feature_name for f in cur_poly.features)
+                poly_data_dicts.append({**cur_job_dict, **assembly_name_dict, **cur_poly_dict})
+                cur_assembly_dict['polymorphism_count'] += 1
 
+            assembly_data_dicts.append({**cur_job_dict, **assembly_name_dict, **dict(correct=''), **cur_assembly_dict})
+
+    # write the data
     results_xlsx = result_dir / f'{experiment_id}_full_results.xlsx'
     logger.info(f'Writing combined data to {results_xlsx.as_posix()}')
     with pd.ExcelWriter(results_xlsx) as xlsx:
-        for cur_sheet, cur_data in dataframes.items():
-            cur_df = pd.concat(cur_data)
-            cur_df.to_excel(xlsx, cur_sheet)
+        pd.DataFrame(assembly_data_dicts).to_excel(xlsx, 'Summary', index=False)
+        pd.DataFrame(feature_data_dicts).to_excel(xlsx, 'Features', index=False)
+        pd.DataFrame(poly_data_dicts).to_excel(xlsx, 'Polymorphisms', index=False)
+        pd.DataFrame(error_dicts).to_excel(xlsx, 'Errors', index=False)
 
     zip_path = result_dir / f'{experiment_id}_NGS_analysis.zip'
     with ZipFile(zip_path, 'w') as zf:
@@ -587,12 +598,12 @@ async def combine_results(jobs: PlasmidSeqRunList):
 
     add_files(f'{experiment_id}/results', results_xlsx, zip_path)
 
-    with Session(engine) as session:
-        for j in jobs.runs:
-            db_j = session.get(PlasmidSeqRun, j.id)
-            db_j.last_step = 'Complete'
+    for j in job_runs:
+        j = session.get(PlasmidSeqRun, j.id)
+        j.last_step = 'Complete'
+        session.add(j)
 
-        session.commit()
+    session.commit()
 
     return jobs
 

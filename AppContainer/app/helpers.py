@@ -7,7 +7,7 @@ from gfapy.line.edge import Link
 from nanoid import generate
 
 from gfapy import Gfa
-from networkx import Graph
+from networkx import Graph, MultiGraph
 import networkx.algorithms as nxa
 import pydna.all as pyd
 from pydna.dseq import Dseq
@@ -48,7 +48,7 @@ def upload_files(*file_paths: Path) -> Optional[str]:
     return folder_name
 
 
-def add_files(folder: str, *file_paths: Path) -> bool:
+def add_files(folder: str, *file_paths: Path, recursive=True) -> bool:
     """
     :param folder: A string indicating the name of the folder in the S3 bucket where the files will be uploaded.
     :param file_paths: Any number of `Path` objects representing the paths of the files to be uploaded.
@@ -63,13 +63,13 @@ def add_files(folder: str, *file_paths: Path) -> bool:
     file_names_by_in_path = {str(p): f"{folder}/{p.name}" for p in file_paths}
 
     # Upload files to the S3 bucket
-    try:
-        for cur_path, cur_name in file_names_by_in_path.items():
+    for cur_path, cur_name in file_names_by_in_path.items():
+        try:
             s3.upload_file(cur_path, 'foundry-plasmid-seq', cur_name)
-    except Exception as e:
-        print(e)
-        return False
-
+        except IsADirectoryError:
+            if recursive:
+                child_folder = Path(cur_path)
+                add_files(cur_name, *child_folder.iterdir(), recursive=True)
     return True
 
 
@@ -96,7 +96,14 @@ def plasmids_from_gfa(gfa_data: Gfa) -> list[tuple[Dseq, str, float]]:
     path. It returns a list of pydna.Dseq objects that represent the full sequences of the plasmids derived from the
     GFA data.
     """
-    graph = Graph()
+    # First, check if this is even necessary
+    if len(gfa_data.segment_names) == 1:
+        segment_name = gfa_data.segment_names[0]
+        segment = gfa_data.segment(segment_name)
+        return [(pyd.Dseq(segment.sequence), f'{segment_name}+', 1.0)]
+
+
+    graph = MultiGraph()
     # graph.add_nodes_from(g.segment_names)
     sequences = {}
     prevalence = {}
@@ -125,6 +132,11 @@ def plasmids_from_gfa(gfa_data: Gfa) -> list[tuple[Dseq, str, float]]:
         out_path_strings.append(', '.join(path[0::2]).replace('L', '+').replace('R', '-'))
         min_prevalence.append(min(prevalence[f] for f in path))
 
+    # Normalize min_prevalence
+    if min_prevalence:
+        max_prevalance = max(min_prevalence)
+        min_prevalence = [v/max_prevalance for v in min_prevalence]
+
     return list(zip(full_sequences, out_path_strings, min_prevalence))
 
 
@@ -151,3 +163,6 @@ def create_and_add_new_codon_table(table_name, base_table, modifications, start_
 
     # Add the new table to the available unambiguous DNA tables
     CodonTable.unambiguous_dna_by_name[table_name] = new_codon_table
+
+if __name__ == '__main__':
+    plasmids_from_gfa(Gfa.from_file(r'C:\Users\RobertWarden-Rothman\PycharmProjects\denovo_plasmid_assembly\tests\GBFP-1384-0254\007_final_clean.gfa'))

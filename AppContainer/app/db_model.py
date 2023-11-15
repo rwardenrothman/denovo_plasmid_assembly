@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Tuple, Union, TypeVar
 
 import boto3
 from sqlmodel import SQLModel, Field, create_engine, Relationship
@@ -25,6 +25,7 @@ class PlasmidSeqRun(LambdaMixin, table=True):
     experiment_id: str
     last_step: Optional[str]
     template_name: Optional[str]
+    template_length: Optional[int]
     basespace_href: Optional[str]
     assembly_count: int = Field(default=0)
     error_type: Optional[str]
@@ -44,7 +45,7 @@ class PlasmidSeqRun(LambdaMixin, table=True):
         return f"{self.template_name}.gb"
 
 
-class PlasmidSeqAssembly(SQLModel, table=True):
+class PlasmidSeqAssembly(LambdaMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key='plasmidseqrun.id')
     assembly_name: str
@@ -73,6 +74,7 @@ class FeaturePolymorphism(SQLModel, table=True):
 class AssemblyFeature(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     assembly_id: int = Field(foreign_key='plasmidseqassembly.id')
+    feature_type: str
     wt_feature_name: str
     assembly_feature_name: str
     deleted: bool = Field(default=False)
@@ -86,6 +88,7 @@ class AssemblyFeature(SQLModel, table=True):
 class AssemblyPolymorphism(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     assembly_id: int = Field(foreign_key='plasmidseqassembly.id')
+    poly_type: str
     wt_nt_start: int
     wt_nt_end: int
     assembly_nt_start: int
@@ -97,13 +100,26 @@ class AssemblyPolymorphism(SQLModel, table=True):
 
 
 class MapStatusInfo(SQLModel):
-    Status: Optional[str]
     Error: Optional[str]
     Cause: Optional[str]
+    RunID: Optional[int]
+
+
+RunListTypes = Union[PlasmidSeqRun, MapStatusInfo, "PlasmidSeqRunList"]
+RLT = TypeVar("RLT", bound=RunListTypes)
 
 
 class PlasmidSeqRunList(LambdaMixin):
-    runs: List[Union[PlasmidSeqRun, MapStatusInfo]]
+    runs: List[RunListTypes]
+
+    def runs_of_type(self, run_type: type[RLT]) -> list[RLT]:
+        out_list = []
+        for r in self.runs:
+            if isinstance(r, run_type):
+                out_list.append(r)
+            elif isinstance(r, PlasmidSeqRunList):
+                out_list.extend(r.runs_of_type(run_type))
+        return out_list
 
 
 class ExperimentStartModel(LambdaMixin):
