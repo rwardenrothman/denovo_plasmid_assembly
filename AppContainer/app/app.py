@@ -1,3 +1,4 @@
+import re
 from collections import defaultdict
 from pathlib import Path
 from subprocess import TimeoutExpired
@@ -215,7 +216,6 @@ async def setup(job: PlasmidSeqRun, session: DSession):
     logger.info(f'{job.data_id} - Downloading template gbk from LG')
     template_folder = tmp_folder / 'template_gbk'
     template_folder.mkdir(exist_ok=True, parents=True)
-    gbk_file = template_folder / f"{job.template_name}.gb"
     plasmid = Plasmid.from_name(job.template_name)
     if not plasmid:
         logger.debug(f'{job.template_name} does not exist as a plasmid.')
@@ -231,6 +231,16 @@ async def setup(job: PlasmidSeqRun, session: DSession):
             detail = f'{job.template_name} does not exist as a plasmid or clone ID.'
             raise ValueError(detail)
 
+    # Check for a foundry workflow template
+    if m := re.search(r'Clonal plasmid isolate of (.+)', plasmid.description):
+        plasmid = Plasmid.from_name(m.group(1))
+        j = session.get(PlasmidSeqRun, job.id)
+        j.template_name = plasmid.name
+        session.commit()
+        session.refresh(j)
+        job = j
+
+    gbk_file = template_folder / job.template_gb
     if plasmid.sequence is not None:
         plasmid.sequence.write(str(gbk_file))
     else:
