@@ -134,7 +134,7 @@ def plasmids_from_gfa(gfa_data: Gfa) -> list[tuple[Dseq, str, float]]:
 
     # Normalize min_prevalence
     if min_prevalence:
-        max_prevalance = max(min_prevalence)
+        max_prevalance = sum(min_prevalence)
         min_prevalence = [v/max_prevalance for v in min_prevalence]
 
     return list(zip(full_sequences, out_path_strings, min_prevalence))
