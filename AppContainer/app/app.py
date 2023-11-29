@@ -624,7 +624,8 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
         assembly_data_df['bp_diff'] = abs(assembly_data_df['expected_bp'] - assembly_data_df['length'])
         assembly_data_df = assembly_data_df.reindex(['template', 'sample', 'assembly_count', 'assembly',
                                                      'expected_bp', 'length', 'bp_diff', 'min_prevalence',
-                                                     'polymorphism_count', 'modified_features'], axis=1)
+                                                     'polymorphism_count', 'coverage_mean', 'coverage_std',
+                                                     'modified_features'], axis=1)
         assembly_data_df.to_excel(xlsx, 'Summary', index=False)
         pd.DataFrame(feature_data_dicts).drop_duplicates().to_excel(xlsx, 'Features', index=False)
         pd.DataFrame(poly_data_dicts).drop_duplicates().to_excel(xlsx, 'Polymorphisms', index=False)
