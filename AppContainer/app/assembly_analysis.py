@@ -104,6 +104,9 @@ def align_sequences(template_path: Path, assembly_path: Path,
     diffs = (diffs0 != 1) | (diffs1 != 1) | (diffs2 != 1)
     poly_ids = (diffs).cumsum()
     bp_map.loc[polys_only.index, 'poly_id'] = poly_ids
+    bp_map['template_aa'] = None
+    bp_map['assembly_aa'] = None
+
 
     # Add features to the table
     features_by_id: dict[int, SeqFeature] = dict(enumerate(template_record.sorted_features()))
@@ -130,9 +133,6 @@ def align_sequences(template_path: Path, assembly_path: Path,
 
         template_len = len(template_indices)
         assembly_len = len(assembly_indices)
-        bp_map['template_aa'] = None
-        bp_map['assembly_aa'] = None
-
         if cur_feature.type == 'CDS':
             bp_map.loc[template_indices, 'template_res_id'] = list(threepeat(count(1), template_len))
 
@@ -302,15 +302,15 @@ def assembly_analysis_pipeline(template_path: Path, assembly_path: Path, assembl
 
 
 if __name__ == '__main__':
-    t_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0240\analysis_step\GBFP-1384-0240.3\GBFP-1384-0240.gb")
-    a_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0240\analysis_step\GBFP-1384-0240.3\GBFP-1384-0240.3.gb")
-    o_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0240\analysis_step\GBFP-1384-0240.3\GBFP-1384-0240.3_a.gb")
+    t_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repicks\GBFP-1384-0183\analysis_step\GBFP-1384-0183.1\GBFT-1384-0022.gb")
+    a_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repicks\GBFP-1384-0183\analysis_step\GBFP-1384-0183.1\GBFP-1384-0183.1.gb")
+    o_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repicks\GBFP-1384-0183\analysis_step\GBFP-1384-0183.1\GBFP-1384-0183.1_a.gb")
 
     from AppContainer.app.app import engine
     from AppContainer.app.db_model import PlasmidSeqRun
 
     with Session(engine) as cur_session:
-        assy_obj = cur_session.get(PlasmidSeqAssembly, 333)
+        assy_obj = cur_session.get(PlasmidSeqAssembly, 667)
         a_record = assembly_analysis_pipeline(t_file, a_file, assy_obj, cur_session)
         a_record.write(str(o_file))
 
