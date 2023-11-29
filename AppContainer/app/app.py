@@ -34,7 +34,7 @@ if 'AppContainer' in __file__:
 else:
     from denovo_from_paper import *
     from helpers import add_files, plasmids_from_gfa
-    from assembly_analysis import assembly_analysis_pipeline
+    from assembly_analysis import assembly_analysis_pipeline, AssemblyTooShortError
     from basespace import basespace_get
     from db_model import (make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList,
                           PlasmidSeqAssembly)
@@ -370,14 +370,39 @@ async def assemble(job: PlasmidSeqRun, session: DSession, bucket: S3Bucket):
     try:
         run_command(' '.join(unicycler_command))
         assembly_fasta = result_folder / 'assembly.fasta'
-        add_files(job.data_path(S3Folders.ASSEMBLY), *result_folder.iterdir())
         assert assembly_fasta.is_file()
+        add_files(job.data_path(S3Folders.ASSEMBLY), *result_folder.iterdir())
     except OSError as ose:
         raise ose
     except AssertionError:
         raise FileNotFoundError(f'{job.data_path()} did not result in an assembly file.')
     except TimeoutExpired:
         raise TimeoutError(f'{job.data_path()} could not be assembled in 14 min.')
+
+    # Get assembly depth information
+    spades_logfile = result_folder / 'spades_assembly' / 'spades.log'
+    coverage_dict = {}
+    cur_k = None
+    for c_line in spades_logfile.read_text().splitlines(keepends=False):
+        if cur_k is None and c_line.startswith('===== K') and 'started' in c_line:
+            cur_k = c_line.split()[1]
+        elif cur_k is not None and 'kmer_coverage_model.cpp   : 309' in c_line:
+            coverage_data = c_line.split('   ')[-1]
+            coverage_split = coverage_data.replace('std.', 'std').replace('. ', ': ').split(': ')
+            coverage_dict[cur_k] = {'mean': float(coverage_split[1]), 'std': float(coverage_split[3])}
+            cur_k = None
+
+    unicycler_logfile = result_folder / 'unicycler.log'
+    best_key = ''
+    for c_line in unicycler_logfile.read_text().splitlines(keepends=False):
+        if ' ← best' in c_line:
+            best_key = 'K' + c_line.split()[0]
+            break
+
+    job = session.get(PlasmidSeqRun, job.id)
+    job.assembly_coverage_mean = coverage_dict[best_key]['mean']
+    job.assembly_coverage_std = coverage_dict[best_key]['std']
+    session.commit()
 
     return set_last_step(session, job, 'Assemble')
 
@@ -529,15 +554,18 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
     error_dicts = []
     all_experiment_runs: List[PlasmidSeqRun] = (session.query(PlasmidSeqRun)
                                                 .where(PlasmidSeqRun.experiment_id == experiment_id).all())
+    completed_jobs: List[PlasmidSeqRun] = []
     for cur_job in all_experiment_runs:
         # cur_job = session.get(PlasmidSeqRun, cur_job.id)
         if cur_job.last_step == 'Error':
             error_dicts.append(cur_job.dict(exclude=dict(id=True, last_step=True, basespace_href=True,
-                                                         assembly_count=True)))
+                                                         assembly_count=True, experiment_id=True,
+                                                         template_length=True)))
             continue
 
         cur_job_dict = dict(template=cur_job.template_name, sample=cur_job.data_id,
-                            assembly_count=cur_job.assembly_count, expected_bp=cur_job.template_length)
+                            assembly_count=cur_job.assembly_count, expected_bp=cur_job.template_length,
+                            coverage_mean=cur_job.assembly_coverage_mean, coverage_std=cur_job.assembly_coverage_std)
         logger.info(cur_job_dict)
         for cur_assembly in cur_job.assemblies:
             logger.info(f'Gathering information on {cur_assembly.assembly_name}')
@@ -550,8 +578,9 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
                     error_dicts.append(dict(data_id=cur_job.data_id, template_name=cur_job.template_name,
                                             error_type='ValueError', error_path='/transfer_annotations',
                                             error_message=f"{cur_assembly.assembly_name} is too short to properly align"
-                                                          f" bp:{cur_assembly.length:d}, "
+                                                          f" / bp:{cur_assembly.length:d}, "
                                                           f"expected:{cur_job.template_length}"))
+                    continue
                 logger.warning(f'Could not find {gb_file_path} on S3. Retrying.')
                 try:
                     bucket.download_file(gb_file_path, cur_gb_file.as_posix())
@@ -563,7 +592,7 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
                     continue
             zipfiles['genbanks'].append(cur_gb_file)
 
-            cur_assembly_dict = cur_assembly.dict(exclude=dict(id=True, run_id=True))
+            cur_assembly_dict = cur_assembly.dict(exclude=dict(id=True, run_id=True, contig_path=True))
             assembly_name_dict = {'assembly': cur_assembly_dict.pop('assembly_name')}
             cur_assembly_dict['polymorphism_count'] = 0
 
@@ -573,7 +602,7 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
                 cur_feature_dict['modified'] = (cur_feature.wt_feature_name != cur_feature.assembly_feature_name
                                                 or cur_feature.deleted)
                 if cur_feature_dict['modified']:
-                    cur_feature_mods.append(cur_feature.assembly_feature_name)
+                    cur_feature_mods.append(cur_feature.wt_feature_name)
                 feature_data_dicts.append({**cur_job_dict, **assembly_name_dict, **cur_feature_dict})
             cur_assembly_dict['modified_features'] = ', '.join(cur_feature_mods)
 
@@ -583,15 +612,22 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
                 poly_data_dicts.append({**cur_job_dict, **assembly_name_dict, **cur_poly_dict})
                 cur_assembly_dict['polymorphism_count'] += 1
 
-            assembly_data_dicts.append({**cur_job_dict, **assembly_name_dict, **dict(correct=''), **cur_assembly_dict})
+            assembly_data_dicts.append({**cur_job_dict, **assembly_name_dict, **cur_assembly_dict})
+
+        completed_jobs.append(cur_job)
 
     # write the data
     results_xlsx = result_dir / f'{experiment_id}_full_results.xlsx'
     logger.info(f'Writing combined data to {results_xlsx.as_posix()}')
     with pd.ExcelWriter(results_xlsx) as xlsx:
-        pd.DataFrame(assembly_data_dicts).to_excel(xlsx, 'Summary', index=False)
-        pd.DataFrame(feature_data_dicts).to_excel(xlsx, 'Features', index=False)
-        pd.DataFrame(poly_data_dicts).to_excel(xlsx, 'Polymorphisms', index=False)
+        assembly_data_df = pd.DataFrame(assembly_data_dicts).sort_values(['template', 'assembly'])
+        assembly_data_df['bp_diff'] = abs(assembly_data_df['expected_bp'] - assembly_data_df['length'])
+        assembly_data_df = assembly_data_df.reindex(['template', 'sample', 'assembly_count', 'assembly',
+                                                     'expected_bp', 'length', 'bp_diff', 'min_prevalence',
+                                                     'polymorphism_count', 'modified_features'], axis=1)
+        assembly_data_df.to_excel(xlsx, 'Summary', index=False)
+        pd.DataFrame(feature_data_dicts).drop_duplicates().to_excel(xlsx, 'Features', index=False)
+        pd.DataFrame(poly_data_dicts).drop_duplicates().to_excel(xlsx, 'Polymorphisms', index=False)
         pd.DataFrame(error_dicts).to_excel(xlsx, 'Errors', index=False)
 
     zip_path = result_dir / f'{experiment_id}_NGS_analysis.zip'
@@ -603,7 +639,7 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
 
     add_files(f'{experiment_id}/results', results_xlsx, zip_path)
 
-    for j in job_runs:
+    for j in completed_jobs:
         j = session.get(PlasmidSeqRun, j.id)
         j.last_step = 'Complete'
         session.add(j)

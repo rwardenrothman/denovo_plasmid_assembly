@@ -28,6 +28,8 @@ class PlasmidSeqRun(LambdaMixin, table=True):
     template_length: Optional[int]
     basespace_href: Optional[str]
     assembly_count: int = Field(default=0)
+    assembly_coverage_mean: Optional[float]
+    assembly_coverage_std: Optional[float]
     error_type: Optional[str]
     error_message: Optional[str]
     error_path: Optional[str]
