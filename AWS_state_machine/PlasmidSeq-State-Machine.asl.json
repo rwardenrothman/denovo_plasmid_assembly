@@ -1,0 +1,291 @@
+{
+  "Comment": "A description of my state machine",
+  "StartAt": "Get Experiment Tasks",
+  "States": {
+    "Get Experiment Tasks": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::apigateway:invoke",
+      "Parameters": {
+        "ApiEndpoint": "vs0zqwkv7f.execute-api.us-east-1.amazonaws.com",
+        "Method": "POST",
+        "Headers": {},
+        "Stage": "testing",
+        "Path": "/start_experiment",
+        "QueryParameters": {},
+        "RequestBody.$": "$",
+        "AuthType": "NO_AUTH"
+      },
+      "Next": "Map",
+      "ResultSelector": {
+        "body.$": "$.ResponseBody"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "ApiGateway.504"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 1
+        }
+      ]
+    },
+    "Map": {
+      "Type": "Map",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "DISTRIBUTED",
+          "ExecutionType": "STANDARD"
+        },
+        "StartAt": "Download Fastqs",
+        "States": {
+          "Download Fastqs": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::apigateway:invoke",
+            "Parameters": {
+              "ApiEndpoint": "vs0zqwkv7f.execute-api.us-east-1.amazonaws.com",
+              "Method": "POST",
+              "Headers": {},
+              "Stage": "testing",
+              "Path": "/setup",
+              "QueryParameters": {},
+              "RequestBody.$": "$",
+              "AuthType": "NO_AUTH"
+            },
+            "Next": "Trim Fastqs",
+            "OutputPath": "$.ResponseBody"
+          },
+          "Trim Fastqs": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::apigateway:invoke",
+            "Parameters": {
+              "ApiEndpoint": "vs0zqwkv7f.execute-api.us-east-1.amazonaws.com",
+              "Method": "POST",
+              "Headers": {},
+              "Stage": "testing",
+              "Path": "/trim",
+              "QueryParameters": {},
+              "RequestBody.$": "$",
+              "AuthType": "NO_AUTH"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "Assemble with Check",
+            "OutputPath": "$.ResponseBody"
+          },
+          "Assemble with Check": {
+            "Type": "Parallel",
+            "Next": "Make Plasmids",
+            "Branches": [
+              {
+                "StartAt": "Check Assembly",
+                "States": {
+                  "Check Assembly": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::apigateway:invoke",
+                    "Parameters": {
+                      "ApiEndpoint": "vs0zqwkv7f.execute-api.us-east-1.amazonaws.com",
+                      "Method": "POST",
+                      "Headers": {},
+                      "Stage": "testing",
+                      "Path": "/check_transition/Trim/Assemble",
+                      "QueryParameters": {},
+                      "RequestBody.$": "$",
+                      "AuthType": "NO_AUTH"
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "ApiGateway.127",
+                          "ApiGateway.527"
+                        ],
+                        "IntervalSeconds": 30,
+                        "MaxAttempts": 30,
+                        "BackoffRate": 1,
+                        "JitterStrategy": "FULL",
+                        "Comment": "Still Checking"
+                      }
+                    ],
+                    "End": true,
+                    "OutputPath": "$.ResponseBody"
+                  }
+                }
+              },
+              {
+                "StartAt": "Assemble",
+                "States": {
+                  "Assemble": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "arn:aws:lambda:us-east-1:409124030547:function:plasmid-seq-processing:$LATEST",
+                      "Payload": {
+                        "body.$": "States.JsonToString($)",
+                        "resource": "/",
+                        "path": "/assemble",
+                        "httpMethod": "POST",
+                        "requestContext": {}
+                      }
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "Lambda.ServiceException",
+                          "Lambda.AWSLambdaException",
+                          "Lambda.SdkClientException",
+                          "Lambda.TooManyRequestsException"
+                        ],
+                        "IntervalSeconds": 1,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2
+                      }
+                    ],
+                    "TimeoutSeconds": 900,
+                    "OutputPath": "$.Payload.body",
+                    "End": true
+                  }
+                }
+              }
+            ],
+            "OutputPath": "$[0]"
+          },
+          "Make Plasmids": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::apigateway:invoke",
+            "Parameters": {
+              "ApiEndpoint": "vs0zqwkv7f.execute-api.us-east-1.amazonaws.com",
+              "Method": "POST",
+              "Headers": {},
+              "Stage": "testing",
+              "Path": "/make_plasmids",
+              "QueryParameters": {},
+              "RequestBody.$": "$",
+              "AuthType": "NO_AUTH"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "Assembly Map",
+            "OutputPath": "$.ResponseBody"
+          },
+          "Assembly Map": {
+            "Type": "Map",
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "Transfer Annotations",
+              "States": {
+                "Transfer Annotations": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::apigateway:invoke",
+                  "Parameters": {
+                    "ApiEndpoint": "vs0zqwkv7f.execute-api.us-east-1.amazonaws.com",
+                    "Method": "POST",
+                    "Headers": {},
+                    "Stage": "testing",
+                    "Path": "/transfer_annotations",
+                    "QueryParameters": {},
+                    "RequestBody.$": "$",
+                    "AuthType": "NO_AUTH"
+                  },
+                  "Retry": [
+                    {
+                      "ErrorEquals": [
+                        "Lambda.ServiceException",
+                        "Lambda.AWSLambdaException",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException",
+                        "ApiGateway.500"
+                      ],
+                      "IntervalSeconds": 1,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "OutputPath": "$.ResponseBody",
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "ApiGateway.538"
+                      ],
+                      "Next": "Pass",
+                      "Comment": "Too Short"
+                    }
+                  ],
+                  "End": true
+                },
+                "Pass": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            },
+            "End": true,
+            "ItemsPath": "$.assemblies",
+            "OutputPath": "$[0]"
+          }
+        }
+      },
+      "Label": "Map",
+      "MaxConcurrency": 1000,
+      "ItemsPath": "$.body.runs",
+      "ResultSelector": {
+        "runs.$": "$"
+      },
+      "Next": "Combine",
+      "ToleratedFailurePercentage": 100
+    },
+    "Combine": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:409124030547:function:plasmid-seq-processing:$LATEST",
+        "Payload": {
+          "body.$": "States.JsonToString($)",
+          "resource": "/",
+          "path": "/combine",
+          "httpMethod": "POST",
+          "requestContext": {}
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "TimeoutSeconds": 900,
+      "OutputPath": "$.Payload.body",
+      "End": true
+    }
+  }
+}
