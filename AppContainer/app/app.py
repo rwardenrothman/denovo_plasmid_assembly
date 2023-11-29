@@ -183,7 +183,7 @@ async def start_expt(exp_data: ExperimentStartModel):
 
 
 @app.post('/setup', response_model=PlasmidSeqRun)
-async def setup(job: PlasmidSeqRun):
+async def setup(job: PlasmidSeqRun, session: DSession):
     if job.last_step not in ['Queued', 'Error']:
         return job
 
@@ -237,34 +237,30 @@ async def setup(job: PlasmidSeqRun):
         raise ValueError(f'{job.template_name} does not have a sequence in LabGuru')
 
     logger.info(f'{job.data_id} - Writing Template to S3')
-    add_files(job.data_path('template'), gbk_file)
+    add_files(job.data_path(S3Folders.TEMPLATE), gbk_file)
 
     logger.info(f'{job.data_id} - Updating Job in RDS')
-    with Session(engine) as session:
-        job = set_last_step(session, job, 'Setup')
+    job = set_last_step(session, job, 'Setup')
     return job
 
 
 @app.post('/trim', response_model=PlasmidSeqRun)
-async def trim_fastqs(job: PlasmidSeqRun):
+async def trim_fastqs(job: PlasmidSeqRun, session: DSession, bucket: S3Bucket):
     if job.last_step != 'Setup':
         return job
     # copy files to the temp folder
     tmp_folder = Path('/tmp') / job.data_path('trim_step')
     tmp_folder.mkdir(exist_ok=True, parents=True)
 
-    s3 = boto3.resource('s3', region_name='us-east-1')
-    bucket_resource = s3.Bucket('foundry-plasmid-seq')
-
     r1_file: Optional[Path] = None
     r2_file: Optional[Path] = None
 
-    for obj in bucket_resource.objects.filter(Prefix=job.data_path('raw_fastq')):
+    for obj in bucket.objects.filter(Prefix=job.data_path(S3Folders.RAW_FASTQ)):
         # Define the local path for the file
         target = tmp_folder / Path(obj.key).name
 
         # Download the file from S3 to the target path
-        bucket_resource.download_file(obj.key, str(target))
+        bucket.download_file(obj.key, str(target))
 
         # Set the r1 or r2 file
         if '_R1_' in target.name:
@@ -281,10 +277,9 @@ async def trim_fastqs(job: PlasmidSeqRun):
     fwd_filtered, rev_filtered = trimmomatic(r1_file, r2_file, TRIMMOMATIC_MIN_LENGTH, DEFAULT_WINDOW,
                                              TRIMMOMATIC_DEFAULT_QUALITY, dest_dir, TRIMMOMATIC_PATH, True)
 
-    add_files(job.data_path('trimmed_fastq'), Path(fwd_filtered), Path(rev_filtered))
+    add_files(job.data_path(S3Folders.TRIMMED_FASTQ), Path(fwd_filtered), Path(rev_filtered))
 
-    with Session(engine) as session:
-        job = set_last_step(session, job, 'Trim')
+    job = set_last_step(session, job, 'Trim')
     return job
 
 
