@@ -89,10 +89,10 @@ class AssemblyPolymorphism(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     assembly_id: int = Field(foreign_key='plasmidseqassembly.id')
     poly_type: str
-    wt_nt_start: int
-    wt_nt_end: int
-    assembly_nt_start: int
-    assembly_nt_end: int
+    wt_nt_start: Optional[int]
+    wt_nt_end: Optional[int]
+    assembly_nt_start: Optional[int]
+    assembly_nt_end: Optional[int]
     cds_effect: Optional[str]
 
     assembly: PlasmidSeqAssembly = Relationship(back_populates='polymorphisms')
