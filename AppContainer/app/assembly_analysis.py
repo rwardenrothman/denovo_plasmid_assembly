@@ -1,5 +1,6 @@
+import re
 from pathlib import Path
-from itertools import repeat, count, starmap
+from itertools import repeat, count, starmap, cycle
 from collections import deque
 from typing import Iterable, TypeVar, Optional, Tuple, Dict
 
@@ -68,7 +69,7 @@ def align_sequences(template_path: Path, assembly_path: Path,
 
     # Align circular templates
     aligner = PairwiseAligner()
-    aligner.open_gap_score = -.1 * len(template_record)
+    aligner.open_gap_score = -.05 * len(template_record)
     aligner.query_end_gap_score = 0.
     aligner.target_end_gap_score = 0.
     alignments = aligner.align(str(template_record.seq), str(assembly_record.seq) * 2)
@@ -78,7 +79,9 @@ def align_sequences(template_path: Path, assembly_path: Path,
     shift = dict(alignment.indices.T)[0]
     assembly_record = assembly_record.shifted(shift)
 
-    final_alignments = aligner.align(template_record.seq, assembly_record.seq)
+    final_aligner = PairwiseAligner()
+    final_aligner.open_gap_score = -5
+    final_alignments = final_aligner.align(str(template_record.seq), str(assembly_record.seq))
     best_alignment = sorted(final_alignments)[0]
 
     bp_map = pd.DataFrame(best_alignment.indices.T, columns=['template_pos', 'assembly_pos'])
@@ -142,6 +145,9 @@ def align_sequences(template_path: Path, assembly_path: Path,
             wt_aa = wt_seq.translate(codon_table_obj) + ('X' * template_len)
             bp_map.loc[template_indices, 'template_aa'] = list(threepeat(wt_aa, template_len))
 
+            t_codon_pos = [1, 2, 3] * template_len
+            bp_map.loc[template_indices, 'template_codon_pos'] = t_codon_pos[:template_len]
+
             bp_map.loc[assembly_indices, 'assembly_res_id'] = list(threepeat(count(1), assembly_len))
 
             asy_seq = pyd.Dseq(''.join(bp_map.loc[assembly_indices, 'assembly_nt'].fillna('-')))
@@ -150,11 +156,29 @@ def align_sequences(template_path: Path, assembly_path: Path,
             asy_aa = asy_seq.translate(codon_table_obj) + ('X' * assembly_len)
             bp_map.loc[assembly_indices, 'assembly_aa'] = list(threepeat(asy_aa, assembly_len))
 
+            a_codon_pos = [1, 2, 3] * assembly_len
+            bp_map.loc[assembly_indices, 'assembly_codon_pos'] = a_codon_pos[:assembly_len]
+
+            bp_map.loc[feature_indices, 'reading_frame'] = (bp_map.loc[feature_indices, 'assembly_codon_pos'] -
+                                                            bp_map.loc[feature_indices, 'template_codon_pos']) % 3
+
+            if cur_feature.strand == -1:
+                bp_map.loc[feature_indices, 'reading_frame'] = bp_map.loc[feature_indices, 'reading_frame'].bfill()
+                bp_map.loc[feature_indices, 'template_res_id'] = bp_map.loc[feature_indices, 'template_res_id'].bfill()
+                bp_map.loc[feature_indices, 'assembly_res_id'] = bp_map.loc[feature_indices, 'assembly_res_id'].bfill()
+            else:
+                bp_map.loc[feature_indices, 'reading_frame'] = bp_map.loc[feature_indices, 'reading_frame'].ffill()
+                bp_map.loc[feature_indices, 'template_res_id'] = bp_map.loc[feature_indices, 'template_res_id'].ffill()
+                bp_map.loc[feature_indices, 'assembly_res_id'] = bp_map.loc[feature_indices, 'assembly_res_id'].ffill()
+
         else:
             bp_map.loc[template_indices, 'template_res_id'] = list(range(1, template_len + 1))
             bp_map.loc[assembly_indices, 'assembly_res_id'] = list(range(1, assembly_len + 1))
             bp_map.loc[template_indices, 'template_aa'] = np.nan
-            bp_map.loc[template_indices, 'assembly_aa'] = np.nan
+            bp_map.loc[assembly_indices, 'assembly_aa'] = np.nan
+            bp_map.loc[template_indices, 'template_codon_pos'] = np.nan
+            bp_map.loc[assembly_indices, 'assembly_codon_pos'] = np.nan
+            bp_map.loc[feature_indices, 'reading_frame'] = np.nan
 
     return bp_map, assembly_record, features_by_id
 
@@ -163,9 +187,14 @@ def seq(x):
     return ''.join(x.dropna())
 
 
+RF_DELIMITER = '!rf'
+
+
 def find_effect(row_index, row_data):
     effect_text = None
     poly_type = row_data[('poly_type', 'first')]
+    reading_frame = row_data[('reading_frame', 'first')]
+    reading_frame = None if pd.isna(reading_frame) else int(reading_frame)
 
     try:
         res_min, res_max = int(row_data[('template_res_id', 'min')]), int(row_data[('template_res_id', 'max')])
@@ -184,10 +213,15 @@ def find_effect(row_index, row_data):
             effect_text = f"del{res_min:d}"
             if res_max != res_min:
                 effect_text += f".{res_max:d}"
+            if reading_frame is not None:
+                effect_text += f"{RF_DELIMITER}{reading_frame:d}"
 
         elif poly_type == 'Insertion':
-            effect_text = f"del{res_min:d}"
+            effect_text = f"ins{res_min:d}"
             effect_text += a_aa or a_nt
+            if reading_frame is not None:
+                effect_text += f"{RF_DELIMITER}{reading_frame:d}"
+
     except ValueError as e:
         pass
     return effect_text
@@ -197,6 +231,7 @@ def get_polymorphism_features(bp_map: pd.DataFrame) -> pd.DataFrame:
     bp_map = bp_map.copy()
     bp_map['template_pos'] = bp_map['template_pos'].replace(-1, None).ffill()
     bp_map['assembly_pos'] = bp_map['assembly_pos'].replace(-1, None).ffill()
+
     diffs = bp_map[bp_map['poly_id'].notnull()].copy()
     polys = diffs.groupby('poly_id').agg({'poly_type': ['first'],
                                           'feature_strand': ['min'],
@@ -206,7 +241,8 @@ def get_polymorphism_features(bp_map: pd.DataFrame) -> pd.DataFrame:
                                           'assembly_nt': [seq],
                                           'template_aa': [seq],
                                           'assembly_aa': [seq],
-                                          'template_res_id': ['min', 'max']
+                                          'template_res_id': ['min', 'max'],
+                                          'reading_frame': ['first']
                                           })
     polys[('Effect', 'text')] = list(starmap(find_effect, polys.iterrows()))
     return polys
@@ -241,6 +277,72 @@ def feature_from_row(row_index: int, row_data) -> SeqFeature:
         if k[1] == 'seq' and v:
             feature.qualifiers[k[0]] = [v]
     return feature
+
+
+MUT_RE = re.compile(r'([A-Z*]+)(\d+)([A-Z*]+)')
+INS_RE = re.compile(r'ins(\d+)([A-Z*]+)!rf(\d)')
+DEL_RE = re.compile(r'del(\d+)\.?(\d*)!rf(\d)')
+FS_RE = re.compile(r'fs(\d+)[+-](\d)')
+
+
+def organize_mutations(feature_name: str) -> str:
+    name_base, *mutations = feature_name.split('_')
+
+    muts_by_residue: dict[int, tuple[str, str]] = {}
+    for cur_mut in mutations:
+        if m := MUT_RE.search(cur_mut):
+            wt, res, mut = m.groups()
+            ires = int(res)
+            if ires in muts_by_residue:
+                inverse_mut = f"{mut}{res}{wt}"
+                if muts_by_residue[ires][1] == inverse_mut:
+                    del muts_by_residue[ires]
+                    continue
+                elif m2 := MUT_RE.search(muts_by_residue[ires][1]):
+                    wt2, re2, mut2 = m2.groups()
+                    if wt == mut2:
+                        wt = wt2
+                    elif mut == wt2:
+                        mut = mut2
+
+            if '*' in mut:
+                # remove any excess wt/mut residues
+                stop_loc = mut.find('*')
+                wt = wt[:stop_loc+1]
+                mut = mut[:stop_loc+1]
+
+                muts_by_residue[ires] = ('NONSENSE', f"{wt}{res}{mut}")
+            else:
+                muts_by_residue[ires] = ('SENSE', f"{wt}{res}{mut}")
+        if m := INS_RE.search(cur_mut):
+            res, mut, frame = m.groups()
+            muts_by_residue[int(res)] = ('INS', cur_mut)
+        if m := DEL_RE.search(cur_mut):
+            res, stop_res, frame = m.groups()
+            muts_by_residue[int(res)] = ('DEL', cur_mut)
+
+    out_parts = [name_base]
+    reading_frame = 0
+    for res_id in sorted(muts_by_residue.keys()):
+        m_type, m_str = muts_by_residue[res_id]
+        if m_type in ['INS', 'DEL'] and RF_DELIMITER in m_str:
+            m_str, rf_str = m_str.split(RF_DELIMITER, 1)
+            rf_int = int(rf_str)
+            if rf_int != reading_frame:
+                shift = (rf_int - reading_frame) % 3
+                if reading_frame == 0 or rf_int == 0:
+                    out_parts.append(f'fs{res_id:d}+{shift:d}')
+                reading_frame = rf_int
+            elif reading_frame == 0:
+                out_parts.append(m_str)
+
+        elif reading_frame == 0:
+            out_parts.append(m_str)
+
+            if m_str[-1] == '*':  # truncation, no need to continue
+                break
+
+    return '_'.join(out_parts)
 
 
 def assembly_analysis_pipeline(template_path: Path, assembly_path: Path, assembly_obj: PlasmidSeqAssembly,
@@ -294,17 +396,30 @@ def assembly_analysis_pipeline(template_path: Path, assembly_path: Path, assembl
                 if apm_for_current_poly.cds_effect and apm_for_current_poly.cds_effect != 'None':
                     af.assembly_feature_name += '_' + apm_for_current_poly.cds_effect
 
+            af.assembly_feature_name = organize_mutations(af.assembly_feature_name)
             assy_feature.qualifiers['label'] = [af.assembly_feature_name]
             assembly_record.features.append(assy_feature)
+
+            if m := FS_RE.search(af.assembly_feature_name):
+                res_id, shift = m.groups()
+                af.frameshift_residue = int(res_id)
         session.add(af)
 
     return assembly_record
 
 
 if __name__ == '__main__':
-    t_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repicks\GBFP-1384-0183\analysis_step\GBFP-1384-0183.1\GBFT-1384-0022.gb")
-    a_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repicks\GBFP-1384-0183\analysis_step\GBFP-1384-0183.1\GBFP-1384-0183.1.gb")
-    o_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repicks\GBFP-1384-0183\analysis_step\GBFP-1384-0183.1\GBFP-1384-0183.1_a.gb")
+    names = [
+        'GFP_M1C_D17G_C1M',
+        'GFP_M1C_D17G_C1F',
+    ]
+
+    for n in names:
+        print(organize_mutations(n))
+
+    t_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.gb")
+    a_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.1.gb")
+    o_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.1_a.gb")
 
     from AppContainer.app.app import engine
     from AppContainer.app.db_model import PlasmidSeqRun

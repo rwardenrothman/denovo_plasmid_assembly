@@ -31,6 +31,7 @@
             </DockerEnvVarImpl>
           </list>
         </option>
+        <option name="buildOnly" value="true" />
         <option name="containerName" value="p_seq" />
         <option name="envVars">
           <list>
