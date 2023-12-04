@@ -440,18 +440,6 @@ async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket, sess
     temp_fwd_fragments: list[pyd.Dseq] = [template_seq.seq[i + 1:i + 10] for i in range(0, 51, 10)]
     temp_rev_fragments: list[pyd.Dseq] = [s.reverse_complement() for s in temp_fwd_fragments]
 
-    fwd_match_counts = sum(sum(t_frag in p for p, *_ in seq_info) for t_frag in temp_fwd_fragments)
-    rev_match_counts = sum(sum(t_frag in p for p, *_ in seq_info) for t_frag in temp_rev_fragments)
-
-    if fwd_match_counts > rev_match_counts:
-        needs_rc = False
-    elif rev_match_counts > fwd_match_counts:
-        needs_rc = True
-    elif fwd_match_counts == rev_match_counts:
-        needs_rc = False  # May need to implement more logic here
-    else:
-        needs_rc = False  # Catch all for linting
-
     # Create Sequence Records
     logger.info('Creating the assembly items')
     assembly_folder = tmp_folder / 'assemblies'
@@ -482,6 +470,18 @@ async def construct_plasmids(job: PlasmidSeqRun, bucket_resource: S3Bucket, sess
         session.commit()
         assy_list.append(cur_assy_obj)
         logger.info(f"Added {cur_assy_obj.assembly_name} to database, id={cur_assy_obj.id:d}")
+
+        fwd_match_counts = sum(t_frag in seq for t_frag in temp_fwd_fragments)
+        rev_match_counts = sum(t_frag in seq for t_frag in temp_rev_fragments)
+
+        if fwd_match_counts > rev_match_counts:
+            needs_rc = False
+        elif rev_match_counts > fwd_match_counts:
+            needs_rc = True
+        elif fwd_match_counts == rev_match_counts:
+            needs_rc = False  # May need to implement more logic here
+        else:
+            needs_rc = False  # Catch all for linting
 
         record_seq = seq.reverse_complement() if needs_rc else seq
         cur_record = pyd.Dseqrecord(record_seq, name=cur_assy_obj.assembly_name, circular=True,
@@ -560,7 +560,8 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
         if cur_job.last_step == 'Error':
             error_dicts.append(cur_job.dict(exclude=dict(id=True, last_step=True, basespace_href=True,
                                                          assembly_count=True, experiment_id=True,
-                                                         template_length=True)))
+                                                         template_length=True, assembly_coverage_mean=True,
+                                                         assembly_coverage_std=True)))
             continue
 
         cur_job_dict = dict(template=cur_job.template_name, sample=cur_job.data_id,
@@ -616,19 +617,33 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
 
         completed_jobs.append(cur_job)
 
+    # Generate Summary dataframes
+    feature_data_df = pd.DataFrame(feature_data_dicts)
+    feature_summary = feature_data_df.groupby('assembly').sum()[['deleted', 'modified']]
+    poly_data_df = pd.DataFrame(poly_data_dicts)
+    poly_summary = poly_data_df.groupby(['assembly', 'poly_type'])['sample'].count().reset_index()
+    poly_pivot = poly_summary.pivot(columns='poly_type', index='assembly', values='sample').fillna(0)
+
+    assembly_data_df = pd.DataFrame(assembly_data_dicts).sort_values(['template', 'assembly']).set_index('assembly')
+    assembly_data_df['bp_diff'] = abs(assembly_data_df['expected_bp'] - assembly_data_df['length'])
+    assembly_data_df.loc[feature_summary.index, 'del_feature_count'] = feature_summary['deleted']
+    assembly_data_df.loc[feature_summary.index, 'mod_feature_count'] = feature_summary['modified']
+    assembly_data_df.loc[poly_pivot.index, 'indel_count'] = poly_pivot['Insertion'] + poly_pivot['Deletion']
+
+    assembly_data_df = assembly_data_df.reset_index(drop=False)
+    assembly_data_df = assembly_data_df.reindex(['template', 'sample', 'assembly_count', 'assembly',
+                                                 'expected_bp', 'length', 'bp_diff', 'min_prevalence',
+                                                 'coverage_mean', 'coverage_std', 'polymorphism_count',
+                                                 'indel_count', 'del_feature_count', 'mod_feature_count',
+                                                 'modified_features'], axis=1)  # final col order
+
     # write the data
     results_xlsx = result_dir / f'{experiment_id}_full_results.xlsx'
     logger.info(f'Writing combined data to {results_xlsx.as_posix()}')
     with pd.ExcelWriter(results_xlsx) as xlsx:
-        assembly_data_df = pd.DataFrame(assembly_data_dicts).sort_values(['template', 'assembly'])
-        assembly_data_df['bp_diff'] = abs(assembly_data_df['expected_bp'] - assembly_data_df['length'])
-        assembly_data_df = assembly_data_df.reindex(['template', 'sample', 'assembly_count', 'assembly',
-                                                     'expected_bp', 'length', 'bp_diff', 'min_prevalence',
-                                                     'polymorphism_count', 'coverage_mean', 'coverage_std',
-                                                     'modified_features'], axis=1)
         assembly_data_df.to_excel(xlsx, 'Summary', index=False)
-        pd.DataFrame(feature_data_dicts).drop_duplicates().to_excel(xlsx, 'Features', index=False)
-        pd.DataFrame(poly_data_dicts).drop_duplicates().to_excel(xlsx, 'Polymorphisms', index=False)
+        feature_data_df.drop_duplicates().to_excel(xlsx, 'Features', index=False)
+        poly_data_df.drop_duplicates().to_excel(xlsx, 'Polymorphisms', index=False)
         pd.DataFrame(error_dicts).to_excel(xlsx, 'Errors', index=False)
 
     zip_path = result_dir / f'{experiment_id}_NGS_analysis.zip'
