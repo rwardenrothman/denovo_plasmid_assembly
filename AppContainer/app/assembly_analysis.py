@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 from itertools import repeat, count, starmap, cycle
 from collections import deque
-from typing import Iterable, TypeVar, Optional, Tuple, Dict
+from typing import Iterable, TypeVar, Optional, Tuple, Dict, Union
 
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ from pandas import DataFrame
 from pydna.dseqrecord import Dseqrecord
 from pydna.seqfeature import SeqFeature
 from sqlmodel import Session
-from Bio.Align import PairwiseAligner
+from Bio.Align import PairwiseAligner, PairwiseAlignment, PairwiseAlignments
 import pydna.all as pyd
 
 
@@ -57,6 +57,13 @@ def find_frameshift(seq: str) -> Optional[int]:
     return None
 
 
+def get_best_alignment(alignments: PairwiseAlignments) -> PairwiseAlignment:
+    try:
+        return sorted(alignments)[0]
+    except (MemoryError, OverflowError):
+        return next(alignments)
+
+
 def align_sequences(template_path: Path, assembly_path: Path,
                     codon_table='RC63') -> tuple[DataFrame, Dseqrecord, dict[int, SeqFeature]]:
     codon_table_obj = CodonTable.unambiguous_dna_by_name[codon_table]
@@ -73,7 +80,7 @@ def align_sequences(template_path: Path, assembly_path: Path,
     aligner.query_end_gap_score = 0.
     aligner.target_end_gap_score = 0.
     alignments = aligner.align(str(template_record.seq), str(assembly_record.seq) * 2)
-    alignment = sorted(alignments)[0]
+    alignment = get_best_alignment(alignments)
 
     # Determine sequence shift and re-align
     shift = dict(alignment.indices.T)[0]
@@ -82,7 +89,7 @@ def align_sequences(template_path: Path, assembly_path: Path,
     final_aligner = PairwiseAligner()
     final_aligner.open_gap_score = -5
     final_alignments = final_aligner.align(str(template_record.seq), str(assembly_record.seq))
-    best_alignment = sorted(final_alignments)[0]
+    best_alignment = get_best_alignment(final_alignments)
 
     bp_map = pd.DataFrame(best_alignment.indices.T, columns=['template_pos', 'assembly_pos'])
 
@@ -113,8 +120,12 @@ def align_sequences(template_path: Path, assembly_path: Path,
 
     # Add features to the table
     features_by_id: dict[int, SeqFeature] = dict(enumerate(template_record.sorted_features()))
+    unknown_feature_ids = []
 
     for feature_id, cur_feature in features_by_id.items():
+        cur_feature_name = cur_feature.qualifiers.get('label', [None])[0]
+        if not cur_feature_name:
+            unknown_feature_ids.append(feature_id)
         feature_indices = []
         for cur_loc in cur_feature.location.parts:
             start_index = bp_map[bp_map['template_pos'] == cur_loc.start].index.min()
@@ -130,7 +141,7 @@ def align_sequences(template_path: Path, assembly_path: Path,
             assembly_indices.reverse()
 
         bp_map.loc[feature_indices, 'feature_id'] = feature_id
-        bp_map.loc[feature_indices, 'feature_name'] = cur_feature.qualifiers['label'][0]
+        bp_map.loc[feature_indices, 'feature_name'] = cur_feature_name
         bp_map.loc[feature_indices, 'feature_type'] = cur_feature.type
         bp_map.loc[feature_indices, 'feature_strand'] = cur_feature.strand
 
@@ -179,6 +190,9 @@ def align_sequences(template_path: Path, assembly_path: Path,
             bp_map.loc[template_indices, 'template_codon_pos'] = np.nan
             bp_map.loc[assembly_indices, 'assembly_codon_pos'] = np.nan
             bp_map.loc[feature_indices, 'reading_frame'] = np.nan
+
+    for fid in unknown_feature_ids:
+        del features_by_id[fid]
 
     return bp_map, assembly_record, features_by_id
 
@@ -270,7 +284,7 @@ def feature_from_row(row_index: int, row_data) -> SeqFeature:
     if poly_type == 'Deletion':
         start_pos += 1
     feature_loc = FeatureLocation(int(start_pos), int(end_pos))
-    row_data: dict[tuple[str, str], int | str] = dict(row_data)
+    row_data: dict[tuple[str, str], Union[int, str]] = dict(row_data)
     feature = SeqFeature(feature_loc, 'Polymorphism', strand=0, id=f'Poly_{int(row_index):d}',
                          qualifiers={'Polymorphism Type': [poly_type], 'Effect': [row_data[('Effect', 'text')]]})
     for k, v in row_data.items():
@@ -314,12 +328,14 @@ def organize_mutations(feature_name: str) -> str:
                 muts_by_residue[ires] = ('NONSENSE', f"{wt}{res}{mut}")
             else:
                 muts_by_residue[ires] = ('SENSE', f"{wt}{res}{mut}")
-        if m := INS_RE.search(cur_mut):
+        elif m := INS_RE.search(cur_mut):
             res, mut, frame = m.groups()
             muts_by_residue[int(res)] = ('INS', cur_mut)
-        if m := DEL_RE.search(cur_mut):
+        elif m := DEL_RE.search(cur_mut):
             res, stop_res, frame = m.groups()
             muts_by_residue[int(res)] = ('DEL', cur_mut)
+        else:
+            name_base += '_' + cur_mut
 
     out_parts = [name_base]
     reading_frame = 0
@@ -339,8 +355,8 @@ def organize_mutations(feature_name: str) -> str:
         elif reading_frame == 0:
             out_parts.append(m_str)
 
-            if m_str[-1] == '*':  # truncation, no need to continue
-                break
+            # if m_str[-1] == '*':  # truncation, no need to continue
+            #     break
 
     return '_'.join(out_parts)
 
@@ -378,7 +394,13 @@ def assembly_analysis_pipeline(template_path: Path, assembly_path: Path, assembl
     # Add Features to the map and database
     feature_data = get_features_with_polymorphisms(bp_map)
     for cur_f_id, cur_wt_feature in features_by_id.items():
-        wt_name = feature_data.loc[cur_f_id, 'feature_name']
+        try:
+            wt_name = feature_data.loc[cur_f_id, 'feature_name']
+        except KeyError:
+            error_string = (f"Feature ID {cur_f_id:d} not found in feature data for {assembly_obj.assembly_name}.\n\n"
+                            f"Feature:\n{str()}\n\nfeature_data:\n{feature_data.to_string()}")
+            continue
+
         feature_type = feature_data.loc[cur_f_id, 'feature_type']
         f_start = feature_data.loc[cur_f_id, 'assembly_pos_min']
         f_end = feature_data.loc[cur_f_id, 'assembly_pos_max']
@@ -409,25 +431,26 @@ def assembly_analysis_pipeline(template_path: Path, assembly_path: Path, assembl
 
 
 if __name__ == '__main__':
-    names = [
-        'GFP_M1C_D17G_C1M',
-        'GFP_M1C_D17G_C1F',
-    ]
-
-    for n in names:
-        print(organize_mutations(n))
-
-    t_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.gb")
-    a_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.1.gb")
-    o_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.1_a.gb")
-
-    from AppContainer.app.app import engine
-    from AppContainer.app.db_model import PlasmidSeqRun
-
-    with Session(engine) as cur_session:
-        assy_obj = cur_session.get(PlasmidSeqAssembly, 667)
-        a_record = assembly_analysis_pipeline(t_file, a_file, assy_obj, cur_session)
-        a_record.write(str(o_file))
+    print(organize_mutations('uox13_CYBJN_F6_Y200*_Q217*'))
+    # names = [
+    #     'GFP_M1C_D17G_C1M',
+    #     'GFP_M1C_D17G_C1F',
+    # ]
+    #
+    # for n in names:
+    #     print(organize_mutations(n))
+    #
+    # t_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.gb")
+    # a_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.1.gb")
+    # o_file = Path(r"C:\Users\RobertWarden-Rothman\AppData\Roaming\JetBrains\PyCharm2023.2\docker\p_seq\tmp\1384_repick_1\GBFP-1384-0176\analysis_step\GBFP-1384-0176.1\GBFP-1384-0176.1_a.gb")
+    #
+    # from AppContainer.app.app import engine
+    # from AppContainer.app.db_model import PlasmidSeqRun
+    #
+    # with Session(engine) as cur_session:
+    #     assy_obj = cur_session.get(PlasmidSeqAssembly, 667)
+    #     a_record = assembly_analysis_pipeline(t_file, a_file, assy_obj, cur_session)
+    #     a_record.write(str(o_file))
 
 
 class AssemblyTooShortError(ValueError):

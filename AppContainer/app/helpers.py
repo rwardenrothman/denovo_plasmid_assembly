@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Optional, List, Tuple
 
@@ -163,6 +164,27 @@ def create_and_add_new_codon_table(table_name, base_table, modifications, start_
 
     # Add the new table to the available unambiguous DNA tables
     CodonTable.unambiguous_dna_by_name[table_name] = new_codon_table
+
+
+async def clean_genbank_file(genbank_path: Path, feature_blacklist: List[str] = None):
+    feature_blacklist = feature_blacklist or ['Concatenated_se', 'Editing_History', 'extracted_regio', 'primer_bind',
+                                              'restriction_sit', 'source', 'primer_bind_rev']
+    genbank_fix_re1 = re.compile(r'^(\s{5}\w{15})\w(\d|complement|join)', re.MULTILINE)
+    genbank_fix_re2 = re.compile(r'(\n\s{21}/[\w\s]+)\n\s{21}([\w\s]+)=')
+
+    # Fix the record
+    genbank_path.write_text(
+        genbank_fix_re1.sub(r'\1 \2', genbank_path.read_text())
+    )
+    genbank_path.write_text(
+        genbank_fix_re2.sub(r'\1_\2=', genbank_path.read_text())
+    )
+
+    record: pyd.Dseqrecord = pyd.read(str(genbank_path))
+    record.features = [f for f in record.features if f.type not in feature_blacklist]
+    record.write(str(genbank_path))
+
+
 
 if __name__ == '__main__':
     plasmids_from_gfa(Gfa.from_file(r'C:\Users\RobertWarden-Rothman\PycharmProjects\denovo_plasmid_assembly\tests\GBFP-1384-0254\007_final_clean.gfa'))

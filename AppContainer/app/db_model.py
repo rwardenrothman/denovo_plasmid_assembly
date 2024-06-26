@@ -1,9 +1,10 @@
 import json
 import os
-from typing import Optional, List, Tuple, Union, TypeVar
+from typing import Optional, List, Tuple, Union, TypeVar, Annotated
 
 import boto3
 from sqlmodel import SQLModel, Field, create_engine, Relationship
+from pydantic import validator
 from nanoid import generate as get_nanoid
 
 
@@ -37,7 +38,7 @@ class PlasmidSeqRun(LambdaMixin, table=True):
     assemblies: List["PlasmidSeqAssembly"] = Relationship(back_populates='sample')
 
     def data_path(self, *folders: str) -> str:
-        path = f"{self.experiment_id}/{self.data_id}"
+        path = f"{self.experiment_id.replace(' ', '_')}/{self.data_id}"
         for folder in folders:
             path += '/' + folder
         return path
@@ -46,6 +47,10 @@ class PlasmidSeqRun(LambdaMixin, table=True):
     def template_gb(self) -> str:
         return f"{self.template_name}.gb"
 
+    @validator('template_name', 'data_id', 'experiment_id')
+    @classmethod
+    def strip_template_name(cls, v: str) -> str:
+        return v.strip()
 
 class PlasmidSeqAssembly(LambdaMixin, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

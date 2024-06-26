@@ -1,0 +1,7 @@
+{
+  "body": "",
+  "resource": "/{proxy+}",
+  "path": "/zipfile/Bharat_followup/templates",
+  "httpMethod": "GET",
+  "requestContext": {}
+}

@@ -1,3 +1,4 @@
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -24,7 +25,7 @@ from aws_lambda_powertools import Logger
 
 if 'AppContainer' in __file__:
     from .denovo_from_paper import *
-    from .helpers import add_files, plasmids_from_gfa
+    from .helpers import add_files, plasmids_from_gfa, clean_genbank_file
     from .assembly_analysis import assembly_analysis_pipeline, AssemblyTooShortError
     from .basespace import basespace_get
     from .db_model import make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList, \
@@ -33,7 +34,7 @@ if 'AppContainer' in __file__:
     PRODUCTION = False
 else:
     from denovo_from_paper import *
-    from helpers import add_files, plasmids_from_gfa
+    from helpers import add_files, plasmids_from_gfa, clean_genbank_file
     from assembly_analysis import assembly_analysis_pipeline, AssemblyTooShortError
     from basespace import basespace_get
     from db_model import (make_engine, PlasmidSeqRun, ExperimentStartModel, PlasmidSeqRunList, AssemblyList,
@@ -70,7 +71,7 @@ class LoggerRouteHandler(APIRoute):
             logger.info("Received request")
 
             response = await original_route_handler(request)
-            ctx["body"] = response.body
+            ctx["body"] = getattr(response, 'body', '')
             logger.append_keys(fastapi=ctx)
             logger.info("Successfully completed request")
 
@@ -101,7 +102,7 @@ DSession: TypeAlias = Annotated[Session, Depends(get_session)]
 
 async def pseq_bucket() -> Bucket:
     s3 = boto3.resource('s3', region_name='us-east-1')
-    bucket_resource: Bucket = s3.Bucket('foundry-plasmid-seq')
+    bucket_resource: Bucket = s3.Bucket(os.environ['ANNOTATIONSBUCKET_BUCKET_NAME'])
     return bucket_resource
 
 
@@ -155,18 +156,21 @@ async def handle_too_short_error(request: Request, err: AssemblyTooShortError):
 async def unhandled_exception_handler(request: Request, err: Exception):
     logger.exception("Unhandled exception")
 
-    event_body = request.scope['aws.event']['body']
-    psr = PlasmidSeqRun.parse_raw(event_body)
     error_message = '; '.join(map(str, err.args))
     error_type = type(err).__name__
-    if psr.id and psr.data_id and psr.experiment_id:
-        with Session(engine) as session:
-            db_psr = session.get(PlasmidSeqRun, psr.id)
-            db_psr.last_step = 'Error'
-            db_psr.error_type = error_type
-            db_psr.error_message = error_message
-            db_psr.error_path = request.url.path
-            session.commit()
+    try:
+        event_body = request.scope['aws.event']['body']
+        psr = PlasmidSeqRun.parse_raw(event_body)
+        if psr.id and psr.data_id and psr.experiment_id:
+            with Session(engine) as session:
+                db_psr = session.get(PlasmidSeqRun, psr.id)
+                db_psr.last_step = 'Error'
+                db_psr.error_type = error_type
+                db_psr.error_message = error_message
+                db_psr.error_path = request.url.path
+                session.commit()
+    except:
+        pass
 
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error",
                                                   "ExceptionType": error_type,
@@ -177,9 +181,18 @@ async def unhandled_exception_handler(request: Request, err: Exception):
 async def start_expt(exp_data: ExperimentStartModel):
     logger.info(exp_data.json())
     with Session(engine) as session:
-        jobs = session.scalars(select(PlasmidSeqRun).where(PlasmidSeqRun.experiment_id == exp_data.name)).all()
-        logger.info(jobs)
-    run_list = PlasmidSeqRunList(runs=jobs)
+        jobs: List[PlasmidSeqRun] = session.scalars(select(PlasmidSeqRun).where(PlasmidSeqRun.experiment_id == exp_data.name)).all()
+        stripped_jobs = []
+        for job in jobs:
+            job.template_name = job.template_name.strip() if job.template_name else job.template_name
+            job.data_id = job.data_id.strip() if job.data_id else job.data_id
+            session.add(job)
+            session.commit()
+            session.refresh(job)
+            logger.info(job)
+            stripped_jobs.append(job.copy())
+        logger.info(stripped_jobs)
+    run_list = PlasmidSeqRunList(runs=stripped_jobs)
     return run_list
 
 
@@ -247,6 +260,7 @@ async def setup(job: PlasmidSeqRun, session: DSession):
         raise ValueError(f'{job.template_name} does not have a sequence in LabGuru')
 
     logger.info(f'{job.data_id} - Writing Template to S3')
+    await clean_genbank_file(gbk_file)  # clean up the genbank file from the terrible Geneious annotations
     add_files(job.data_path(S3Folders.TEMPLATE), gbk_file)
 
     logger.info(f'{job.data_id} - Updating Job in RDS')
@@ -568,6 +582,7 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
                             assembly_count=cur_job.assembly_count, expected_bp=cur_job.template_length,
                             coverage_mean=cur_job.assembly_coverage_mean, coverage_std=cur_job.assembly_coverage_std)
         logger.info(cur_job_dict)
+        has_valid_assemblies = False
         for cur_assembly in cur_job.assemblies:
             logger.info(f'Gathering information on {cur_assembly.assembly_name}')
             cur_gb_file = temp_dir / cur_assembly.assembly_gb
@@ -597,6 +612,13 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
             assembly_name_dict = {'assembly': cur_assembly_dict.pop('assembly_name')}
             cur_assembly_dict['polymorphism_count'] = 0
 
+            if len(cur_assembly.features) == 0:
+                error_dicts.append(dict(data_id=cur_job.data_id, template_name=cur_job.template_name,
+                                        error_type='Unknown', error_path='/transfer_annotations',
+                                        error_message=f"No features were logged for {cur_assembly.assembly_name}. This"
+                                                      f"usually indicates an error during annotation."))
+                continue
+
             cur_feature_mods = []
             for cur_feature in cur_assembly.features:
                 cur_feature_dict = cur_feature.dict(exclude=dict(id=True, assembly_id=True))
@@ -614,8 +636,17 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
                 cur_assembly_dict['polymorphism_count'] += 1
 
             assembly_data_dicts.append({**cur_job_dict, **assembly_name_dict, **cur_assembly_dict})
+            has_valid_assemblies = True
 
-        completed_jobs.append(cur_job)
+        if has_valid_assemblies:
+            completed_jobs.append(cur_job)
+        else:
+            err_job = session.get(PlasmidSeqRun, cur_job.id)
+            err_job.last_step = 'Error'
+            err_job.error_type = 'Assembly'
+            err_job.error_message = 'The job contained no valid assemblies'
+            err_job.error_path = '/combine'
+            session.add(err_job)
 
     # Generate Summary dataframes
     feature_data_df = pd.DataFrame(feature_data_dicts)
@@ -677,6 +708,33 @@ async def download_results(expt_id: str):
     bucket_resource.download_file(f'{expt_id}/results/{expt_id}_NGS_analysis.zip', tmp_file)
 
     return FileResponse(tmp_file)
+
+
+@app.get('/zipfile/{expt_id}/templates')
+async def download_templates(expt_id: str, bucket: S3Bucket, session: DSession):
+    tmp_path = Path('/tmp') / expt_id / 'templates' / 'genbanks'
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    zip_path = tmp_path.parent / f'{expt_id}_template_gbs.zip'
+
+    all_experiment_runs: List[PlasmidSeqRun] = (session.query(PlasmidSeqRun)
+                                                .where(PlasmidSeqRun.experiment_id == expt_id).all())
+
+    for cur_run in all_experiment_runs:
+        template_path = cur_run.data_path(S3Folders.TEMPLATE, cur_run.template_gb)
+        print(f'{template_path=}')
+        template_gb_path = tmp_path / cur_run.template_gb
+        bucket.download_file(template_path, template_gb_path)
+
+        # Fix the record
+        await clean_genbank_file(template_gb_path)
+
+    with ZipFile(zip_path, 'w') as zf:
+        for cur_file in tmp_path.iterdir():
+            print(f'{cur_file.name=}')
+            zf.write(cur_file, cur_file.name)
+
+    print(f'{zip_path=}')
+    return FileResponse(zip_path, filename=zip_path.name)
 
 
 if __name__ == "__main__":

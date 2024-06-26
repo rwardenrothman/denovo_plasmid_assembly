@@ -1,10 +1,17 @@
 # Test your FastAPI endpoints
 
-GET http://192.168.135.66:8080/
+GET http://192.168.135.66:9000/
 
 ###
 
-GET http://192.168.135.66:8080/hello/robert
-Accept: application/json
+GET http://192.168.135.66:9000/2015-03-31/functions/function/invocations
+Content-Type: application/json
 
+{
+  "body": "{\"id\":3994,\"data_id\":\"GBFT-1670-171_2\",\"experiment_id\":\"1670 Sequence Validations_3-retry\",\"last_step\":\"Setup\",\"template_name\":\"GBFT-1670-171\",\"basespace_href\":\"https://api.basespace.illumina.com/v2/datasets/ds.189e1a1bf5ea460fa674e5638f5468a5/files\",\"assembly_count\":0}",
+  "resource": "/",
+  "path": "/trim",
+  "httpMethod": "POST",
+  "requestContext": {}
+}
 ###

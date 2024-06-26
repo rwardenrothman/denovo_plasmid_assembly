@@ -111,11 +111,8 @@ if __name__ == '__main__':
     lambda_uri = f"{full_ip}/2015-03-31/functions/function/invocations"
     print(lambda_uri)
 
-    start_model = ExperimentStartModel(name='expressplex_trial_1')
+    resp1 = requests.get(lambda_uri)
 
-    resp1 = requests.post(lambda_uri, json=start_model.lambda_json('start_experiment'))
-
-    r1_data = PlasmidSeqRunList.parse_raw(resp1.content)
 
     print(r1_data)
     # full_pipeline(lambda_uri, fastq_path, gb_path)
