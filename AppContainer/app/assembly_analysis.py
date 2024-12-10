@@ -130,6 +130,8 @@ def align_sequences(template_path: Path, assembly_path: Path,
         for cur_loc in cur_feature.location.parts:
             start_index = bp_map[bp_map['template_pos'] == cur_loc.start].index.min()
             end_index = bp_map[bp_map['template_pos'] == cur_loc.end].index.max()
+            if pd.isna(end_index):
+                end_index = bp_map.index.max()+1
             feature_indices.extend(range(start_index, end_index))
 
         template_indices: list[int] = list(bp_map.loc[feature_indices]['template_nt'].dropna().index.values)

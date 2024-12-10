@@ -4,13 +4,13 @@ python-multipart
 mangum
 nanoid
 boto3
-biopython
+biopython==1.81
 bcbio-gff
 pandas
 openpyxl
 sqlmodel
 psycopg2-binary
-foundrybackend
+foundrybackend==1.1.30
 aws-lambda-powertools
 gfapy
 boto3-stubs[essential]

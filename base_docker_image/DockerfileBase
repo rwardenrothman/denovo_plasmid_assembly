@@ -37,6 +37,6 @@ COPY aws-key .
 RUN echo https://aws:$(cat aws-key)@grobio-foundry-409124030547.d.codeartifact.us-east-2.amazonaws.com/pypi/foundry-pypi/simple/
 RUN python3 -m pip config set global.extra-index-url https://aws:$(cat aws-key)@grobio-foundry-409124030547.d.codeartifact.us-east-2.amazonaws.com/pypi/foundry-pypi/simple/
 RUN rm aws-key
-RUN python3 -m pip install foundrybackend==1.1.21
+RUN python3 -m pip install foundrybackend==1.1.30
 
 CMD [ "function.handler" ]

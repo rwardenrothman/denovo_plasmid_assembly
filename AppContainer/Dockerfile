@@ -1,4 +1,4 @@
-FROM 409124030547.dkr.ecr.us-east-1.amazonaws.com/foundry-plasmidseq-base:2024.04.17.12.34
+FROM 409124030547.dkr.ecr.us-east-1.amazonaws.com/foundry-plasmidseq-base:2024.08.02.16.35
 
 # Install the function's dependencies
 COPY requirements.txt .

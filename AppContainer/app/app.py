@@ -65,7 +65,7 @@ class LoggerRouteHandler(APIRoute):
                 "path": request.url.path,
                 "route": self.path,
                 "method": request.method,
-                "body": request.scope['aws.event']['body']
+                "body": request.scope.get('aws.event', {}).get('body', 'DIRECT_CALL')
             }
             logger.append_keys(fastapi=ctx)
             logger.info("Received request")
@@ -102,7 +102,7 @@ DSession: TypeAlias = Annotated[Session, Depends(get_session)]
 
 async def pseq_bucket() -> Bucket:
     s3 = boto3.resource('s3', region_name='us-east-1')
-    bucket_resource: Bucket = s3.Bucket(os.environ['ANNOTATIONSBUCKET_BUCKET_NAME'])
+    bucket_resource: Bucket = s3.Bucket('foundry-plasmid-seq')
     return bucket_resource
 
 
@@ -204,7 +204,7 @@ async def setup(job: PlasmidSeqRun, session: DSession):
     logger.info(f'{job.data_id} - Importing LabGuruAPI')
     from LabGuruAPI import Plasmid, SESSION
     SESSION.set_config_value('AUTH', 'TOKEN', os.environ['LG_AUTH_TOKEN'])
-    tmp_folder = Path('/tmp') / job.data_path('setup_step')
+    tmp_folder: Path = Path('/tmp') / job.data_path('setup_step')
     logger.info(f'{job.data_id} - Making Temp Folder')
     tmp_folder.mkdir(exist_ok=True, parents=True)
 
@@ -227,7 +227,7 @@ async def setup(job: PlasmidSeqRun, session: DSession):
 
     # get the template file
     logger.info(f'{job.data_id} - Downloading template gbk from LG')
-    template_folder = tmp_folder / 'template_gbk'
+    template_folder: Path = tmp_folder / 'template_gbk'
     template_folder.mkdir(exist_ok=True, parents=True)
     plasmid = Plasmid.from_name(job.template_name)
     if not plasmid:
@@ -245,21 +245,40 @@ async def setup(job: PlasmidSeqRun, session: DSession):
             raise ValueError(detail)
 
     # Check for a foundry workflow template
-    if m := re.search(r'Clonal plasmid isolate of (.+)', plasmid.description):
-        plasmid = Plasmid.from_name(m.group(1))
-        j = session.get(PlasmidSeqRun, job.id)
-        j.template_name = plasmid.name
-        session.commit()
-        session.refresh(j)
-        job = j
+    if plasmid.sequence is not None and (m := re.search(r'Clonal plasmid isolate of (.+)', plasmid.description)):
+        parent_plasmid = Plasmid.from_name(m.group(1))
+        if parent_plasmid:
+            plasmid = parent_plasmid
+            j = session.get(PlasmidSeqRun, job.id)
+            j.template_name = plasmid.name
+            session.commit()
+            session.refresh(j)
+            job = j
+        else:
+            linked_plasmids: List[Plasmid] = plasmid.get_linked_items(Plasmid)
+            for lp in linked_plasmids:
+                if 'GBFT' in lp.name:
+                    plasmid = lp
+                    j = session.get(PlasmidSeqRun, job.id)
+                    j.template_name = plasmid.name
+                    session.commit()
+                    session.refresh(j)
+                    job = j
+                    break
 
-    gbk_file = template_folder / job.template_gb
+
+    gbk_file: Path = template_folder / job.template_gb
     if plasmid.sequence is not None:
-        plasmid.sequence.write(str(gbk_file))
+        out_seq = plasmid.sequence.copy()
+        out_seq.name = plasmid.name[:16]
+        out_seq.id = plasmid.name[:16]
+        out_seq.locus = plasmid.name[:16]
+        out_seq.write(str(gbk_file))
     else:
         raise ValueError(f'{job.template_name} does not have a sequence in LabGuru')
 
     logger.info(f'{job.data_id} - Writing Template to S3')
+    add_files(job.data_path(S3Folders.TEMPLATE, 'bak'), gbk_file)
     await clean_genbank_file(gbk_file)  # clean up the genbank file from the terrible Geneious annotations
     add_files(job.data_path(S3Folders.TEMPLATE), gbk_file)
 
@@ -659,7 +678,7 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
     assembly_data_df['bp_diff'] = abs(assembly_data_df['expected_bp'] - assembly_data_df['length'])
     assembly_data_df.loc[feature_summary.index, 'del_feature_count'] = feature_summary['deleted']
     assembly_data_df.loc[feature_summary.index, 'mod_feature_count'] = feature_summary['modified']
-    assembly_data_df.loc[poly_pivot.index, 'indel_count'] = poly_pivot['Insertion'] + poly_pivot['Deletion']
+    assembly_data_df.loc[poly_pivot.index, 'indel_count'] = poly_pivot.get('Insertion', 0) + poly_pivot.get('Deletion', 0)
 
     assembly_data_df = assembly_data_df.reset_index(drop=False)
     assembly_data_df = assembly_data_df.reindex(['template', 'sample', 'assembly_count', 'assembly',
