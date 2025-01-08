@@ -576,6 +576,7 @@ async def combine_results(jobs: PlasmidSeqRunList, bucket: S3Bucket, session: DS
     zipfiles: defaultdict[str, list[Path]] = defaultdict(list)
 
     # Download Genbank Files
+
     experiment_id = job_runs[0].experiment_id
     result_dir = Path('/tmp') / experiment_id / 'results'
     temp_dir = result_dir / 'full'

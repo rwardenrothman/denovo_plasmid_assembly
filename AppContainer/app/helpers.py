@@ -75,6 +75,25 @@ def add_files(folder: str, *file_paths: Path, recursive=True) -> bool:
 
 
 def filter_invalid_paths(path: List[str]) -> bool:
+    """
+        Filters a list of string paths to determine if all required paths are present.
+
+        Given a list of paths, this function ensures that for each node within the list,
+        all its required child paths (both "L" and "R" suffixed versions) are also present
+        in the list. The function works by identifying all potential parent nodes, deriving
+        their left and right child paths, and confirming that these paths exist in the
+        provided list of paths.
+
+        Parameters
+        ----------
+        path : List[str]
+            List of string paths where each string represents a path node.
+
+        Returns
+        -------
+        bool
+            A boolean value indicating whether all required paths are present.
+    """
     nodes = set(n[:-1] for n in path)
     needed_nodes = {f"{n}L" for n in nodes}
     needed_nodes |= {f"{n}R" for n in nodes}
@@ -142,6 +161,25 @@ def plasmids_from_gfa(gfa_data: Gfa) -> list[tuple[Dseq, str, float]]:
 
 
 def create_and_add_new_codon_table(table_name, base_table, modifications, start_codons=None, stop_codons=None):
+    """
+    Modify and create a new codon translation table based on an existing one.
+
+    This function creates a new codon translation table by modifying an existing
+    one. It applies specific modifications to codon-to-amino-acid translations and
+    allows customization of start and stop codons. The new table is then added to
+    the collection of available codon translation tables for unambiguous DNA.
+
+    Args:
+        table_name (str): The name of the new codon table.
+        base_table (str): The name of the existing base codon table to modify.
+        modifications (dict): A dictionary where keys are codons (str) and values
+            are single-letter amino acid codes (str) representing modifications to
+            the codon-to-amino-acid mapping.
+        start_codons (list[str], optional): A list of codons to use as start codons
+            for the new table. Defaults to the start codons of the base table.
+        stop_codons (list[str], optional): A list of codons to use as stop codons
+            for the new table. Defaults to the stop codons of the base table.
+    """
     # Create a new table based on the given table
     new_table = dict(CodonTable.unambiguous_dna_by_name[base_table].forward_table)
 

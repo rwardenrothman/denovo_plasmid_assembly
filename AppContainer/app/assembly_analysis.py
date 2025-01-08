@@ -29,8 +29,26 @@ create_and_add_new_codon_table('RC63', 'Standard', {'TAG': 'U'}, stop_codons=['T
 T = TypeVar('T')
 
 
-def threepeat(target: Iterable[T], max: int) -> Iterable[T]:
-    if not isinstance(max, int) or max < 1:
+def threepeat(target: Iterable[T], max_iters: int) -> Iterable[T]:
+    """
+    Provides a generator function that replicates each item in the input iterable three times and stops after a maximum number of items
+    have been yielded, based on the specified limit. The function supports input validation for the 'max' parameter.
+
+    Parameters:
+        target: Iterable[T]
+            An iterable containing the items to be repeated.
+        max_iters: int
+            The maximum number of items to yield. Must be a positive integer.
+
+    Returns:
+        Iterable[T]:
+            A generator that yields items from the input iterable, each repeated three times, and stops
+            after yielding 'max' items.
+
+    Raises:
+        None
+    """
+    if not isinstance(max_iters, int) or max_iters < 1:
         return []
     cur_count = 0
     try:
@@ -38,19 +56,55 @@ def threepeat(target: Iterable[T], max: int) -> Iterable[T]:
             for j in repeat(i, 3):
                 yield j
                 cur_count += 1
-                if cur_count == max:
+                if cur_count == max_iters:
                     raise StopIteration()
     except StopIteration:
         pass
 
 
 def triplets(target: Iterable[T]) -> Iterable[T]:
+    """
+    Generates iterable triplets from a given input iterable.
+
+    This function takes an input iterable and processes it to produce triplets,
+    with each triplet containing up to three elements from the original iterable.
+    The generator continues until all elements from the input iterable have been
+    processed.
+
+    Parameters:
+    target: Iterable
+        The input iterable to be split into triplets.
+
+    Yields:
+    Iterable
+        A triplet (up to three elements) chunk of the input iterable, returned
+        as another iterable.
+
+    """
     while target:
         triplet, target = target[:3], target[3:]
         yield triplet
 
 
 def find_frameshift(seq: str) -> Optional[int]:
+    """
+    Find the position of a frameshift in a DNA sequence.
+
+    This function identifies the first codon containing a gap symbol ('-'),
+    indicating a frameshift in the DNA sequence. It returns the 1-based
+    index of the frameshift location or None if no frameshift is found.
+
+    Parameters:
+    seq: str
+        The input DNA sequence to analyze. It is expected to consist of
+        nucleotide characters ('A', 'T', 'C', 'G') and may contain '-'
+        for gaps.
+
+    Returns:
+    Optional[int]
+        The 1-based index of the codon containing a frameshift. Returns
+        None if no frameshift is identified.
+    """
     for i, cur_codon in enumerate(triplets(seq)):
         if '-' in cur_codon:
             return i + 1
@@ -58,6 +112,26 @@ def find_frameshift(seq: str) -> Optional[int]:
 
 
 def get_best_alignment(alignments: PairwiseAlignments) -> PairwiseAlignment:
+    """
+        Selects the best alignment from a collection of alignments.
+
+        This function takes a collection of pairwise alignments and determines the
+        best alignment based on sorting. It handles memory or overflow errors by
+        falling back to returning the next alignment in the iterator when sorting
+        fails.
+
+        Args:
+            alignments: A PairwiseAlignments object, an iterable of alignments.
+
+        Returns:
+            A PairwiseAlignment object representing the best alignment determined
+            either by sorting or by fallback to the first available alignment in the
+            iterable.
+
+        Raises:
+            MemoryError: If sorting fails to process due to memory constraints.
+            OverflowError: If sorting encounters an arithmetic overflow.
+    """
     try:
         return sorted(alignments)[0]
     except (MemoryError, OverflowError):
@@ -66,6 +140,37 @@ def get_best_alignment(alignments: PairwiseAlignments) -> PairwiseAlignment:
 
 def align_sequences(template_path: Path, assembly_path: Path,
                     codon_table='RC63') -> tuple[DataFrame, Dseqrecord, dict[int, SeqFeature]]:
+    """
+    Aligns a template DNA sequence to an assembled DNA sequence while considering circular templates,
+    detecting polymorphisms, and associating sequence features for downstream analysis.
+
+    The function performs the following key steps:
+    - Reads in the template and assembly DNA sequences.
+    - Aligns the sequences using pairwise alignment, accounting for sequence circularity.
+    - Determines and applies sequence shifts to optimize alignment.
+    - Maps base pair position correspondence between the template and assembly sequences.
+    - Identifies and annotates polymorphisms such as SNPs, insertions, and deletions.
+    - Matches features from the template sequence to aligned regions, including CDS-specific details.
+    - Resolves nucleotide-to-amino acid mappings for CDS features with consideration of codon positions.
+
+    Parameters:
+        template_path (Path): The file path to the template DNA sequence in GenBank format.
+        assembly_path (Path): The file path to the assembled DNA sequence in GenBank format.
+        codon_table (str): The name of the codon table used for translating sequences during analysis.
+                           Defaults to 'RC63'.
+
+    Returns:
+        tuple[DataFrame, Dseqrecord, dict[int, SeqFeature]]: A tuple consisting of:
+          - A DataFrame mapping the correspondence of base pair positions, nucleotides, and polymorphisms across
+            the template and assembly sequences, with feature-related annotations.
+          - The assembly sequence record after alignment and adjustment for proper translation.
+          - A dictionary mapping feature IDs in the template sequence to the extracted SeqFeature objects,
+            excluding those with missing or invalid labels.
+
+    Raises:
+        AssemblyTooShortError: Raised when the assembly sequence is significantly shorter than half the length
+                               of the template sequence, preventing meaningful alignment.
+    """
     codon_table_obj = CodonTable.unambiguous_dna_by_name[codon_table]
 
     # Read in files
@@ -200,6 +305,23 @@ def align_sequences(template_path: Path, assembly_path: Path,
 
 
 def seq(x):
+    """
+        Concatenates the non-NA/null values of the given input into a single string.
+
+        This function takes an input, drops all NA/null elements, and joins the
+        remaining elements into a single string.
+
+        Parameters
+        ----------
+        x: pandas.Series
+            Input series containing elements to be processed.
+
+        Returns
+        -------
+        str
+            A string resulting from the concatenation of non-NA/null elements
+            of the input series.
+    """
     return ''.join(x.dropna())
 
 
@@ -207,6 +329,23 @@ RF_DELIMITER = '!rf'
 
 
 def find_effect(row_index, row_data):
+    """
+    Finds and constructs a textual representation of the effect of a given row's genetic
+    mutation or polymorphism. The function analyzes mutation types such as SNP (Single
+    Nucleotide Polymorphism), Deletion, and Insertion to derive a concise description of
+    the mutation effect based on the provided row data. In case of invalid data, proper
+    default behaviors are applied, and None is returned if the effect cannot be determined.
+
+    Args:
+        row_index (int): The index of the row being processed.
+        row_data (pd.Series): A series containing mutation data, which includes fields
+            such as poly_type, reading_frame, template_res_id, assembly_nt, template_nt,
+            template_aa, assembly_aa, and feature_strand.
+
+    Returns:
+        Optional[str]: A string describing the mutation effect if it can be computed
+        from the supplied data. Returns None if the effect cannot be determined.
+    """
     effect_text = None
     poly_type = row_data[('poly_type', 'first')]
     reading_frame = row_data[('reading_frame', 'first')]
@@ -244,6 +383,37 @@ def find_effect(row_index, row_data):
 
 
 def get_polymorphism_features(bp_map: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract polymorphism features from a genome base-pair mapping.
+
+    This function processes a DataFrame containing genome base-pair mappings,
+    identifying positions where polymorphisms occur, calculates relevant
+    differences for those positions, and organizes them into a summarized
+    DataFrame for further analysis. It fills missing positions forward based
+    on the `template_pos` and `assembly_pos` columns and extracts details
+    about the polymorphism effects using the provided utility function.
+
+    Parameters
+    ----------
+    bp_map : pd.DataFrame
+        Input DataFrame that contains genome base-pair mappings. It is
+        expected to have required columns, such as 'template_pos',
+        'assembly_pos', 'poly_id', 'poly_type', and other necessary fields
+        for identifying and describing polymorphisms.
+
+    Returns
+    -------
+    pd.DataFrame
+        A DataFrame summarizing polymorphism features. The output includes
+        details about polymorphism type, genomic locations, sequence changes,
+        and potential functional effects. Grouped and aggregated polymorphic
+        information is provided in a multi-index format.
+
+    Raises
+    ------
+    ValueError
+        Raised if required columns are missing from the input DataFrame.
+    """
     bp_map = bp_map.copy()
     bp_map['template_pos'] = bp_map['template_pos'].replace(-1, None).ffill()
     bp_map['assembly_pos'] = bp_map['assembly_pos'].replace(-1, None).ffill()
@@ -265,10 +435,42 @@ def get_polymorphism_features(bp_map: pd.DataFrame) -> pd.DataFrame:
 
 
 def list_unique(x: pd.Series) -> str:
+    """
+    Returns a string containing unique non-null values in a pandas Series, joined by commas.
+
+    This function processes a given pandas Series, removes null values, extracts
+    the unique values, converts them to strings, and concatenates them into a
+    single string separated by commas.
+
+    Arguments:
+        x (pd.Series): The pandas Series from which unique non-null values
+        are extracted.
+
+    Returns:
+        str: A comma-separated string of unique non-null values from the
+        input Series.
+    """
     return ', '.join(x.dropna().unique().astype(str))
 
 
 def get_features_with_polymorphisms(bp_map: pd.DataFrame) -> pd.DataFrame:
+    """
+        Extracts features containing sequence polymorphisms from a given base-pair mapping dataframe.
+
+        This function processes a given DataFrame to identify features which have polymorphisms in
+        their amino acid sequences, along with additional associated data such as the minimum and
+        maximum positions of these features in the template and assembly sequences. It groups and
+        aggregates the results for each feature and returns a DataFrame containing the processed
+        information.
+
+        Parameters:
+            bp_map (pd.DataFrame): DataFrame containing mappings of base-pair positions, features,
+            and other related information.
+
+        Returns:
+            pd.DataFrame: A DataFrame where each row corresponds to a feature with polymorphisms
+            along with its aggregated attributes.
+    """
     bp_map = bp_map.copy()
     bp_map['aa_change'] = bp_map.fillna('nan').template_aa != bp_map.fillna('nan').assembly_aa
     bp_map['template_pos_min'] = bp_map['template_pos_max'] = bp_map['template_pos'].replace(-1, None).ffill()
@@ -281,6 +483,32 @@ def get_features_with_polymorphisms(bp_map: pd.DataFrame) -> pd.DataFrame:
 
 
 def feature_from_row(row_index: int, row_data) -> SeqFeature:
+    """
+    Constructs and returns a SeqFeature object representing a polymorphism based on
+    the given row data and its index.
+
+    This function processes the row data to extract the type of polymorphism, its start and
+    end positions in the assembly, and additional metadata. The function adjusts the positions
+    for deletions as per the standard, initializes a SeqFeature with the resulting feature
+    location and other metadata, and then populates any sequence-specific qualifiers found
+    in the input data.
+
+    Arguments:
+        row_index: int
+            Index of the row used to uniquely identify the feature.
+        row_data: dict[tuple[str, str], Union[int, str]]
+            Data for a single row, represented as a dictionary where keys are
+            tuples specifying a category and subcategory, and values specify
+            the data corresponding to that category.
+
+    Returns:
+        SeqFeature
+            A constructed SeqFeature object based on the processed row data.
+
+    Raises:
+        KeyError
+            If mandatory keys are not found in the row data.
+    """
     poly_type = row_data[('poly_type', 'first')]
     start_pos, end_pos = row_data[('assembly_pos', 'min')], row_data[('assembly_pos', 'max')] + 1
     if poly_type == 'Deletion':
@@ -302,6 +530,26 @@ FS_RE = re.compile(r'fs(\d+)[+-](\d)')
 
 
 def organize_mutations(feature_name: str) -> str:
+    """
+    Organizes a mutation string into a standardized format.
+
+    This function processes a string containing feature name and associated
+    mutations. It identifies, parses, and categorizes mutations into various
+    types such as substitution, insertion, deletion, or nonsense mutations.
+    Additionally, it handles reading frame adjustments in insertion and deletion
+    mutations if applicable. The output is a reformatted string with mutations
+    organized in a consistent structure.
+
+    Parameters:
+        feature_name: str
+            A string representing the base feature name followed by a series
+            of mutations separated by underscores.
+
+    Returns:
+        str
+            A reformatted string where mutations are organized and structured
+            in a specific format.
+    """
     name_base, *mutations = feature_name.split('_')
 
     muts_by_residue: dict[int, tuple[str, str]] = {}
@@ -365,6 +613,24 @@ def organize_mutations(feature_name: str) -> str:
 
 def assembly_analysis_pipeline(template_path: Path, assembly_path: Path, assembly_obj: PlasmidSeqAssembly,
                                session: Session, codon_table='RC63') -> pyd.Dseqrecord:
+    """
+    This function performs an end-to-end analysis pipeline for plasmid sequence assembly. It aligns
+    the provided template and assembly sequences, identifies polymorphisms, maps features, and
+    updates the corresponding database models with assembly-related features and polymorphisms.
+
+    Args:
+        template_path (Path): The file path to the template DNA sequence.
+        assembly_path (Path): The file path to the assembly DNA sequence.
+        assembly_obj (PlasmidSeqAssembly): An instance of the PlasmidSeqAssembly object representing
+            the assembly process.
+        session (Session): A database session used for persisting assembly-related data.
+        codon_table (str): The codon translation table to be used for sequence analysis. Defaults
+            to 'RC63'.
+
+    Returns:
+        pyd.Dseqrecord: A Biopython SeqRecord object with annotated features resulting from the
+            assembly and polymorphism analysis.
+    """
     bp_map, assembly_record, features_by_id = align_sequences(template_path, assembly_path, codon_table)
 
     # Add polymorphisms to the map
@@ -456,4 +722,11 @@ if __name__ == '__main__':
 
 
 class AssemblyTooShortError(ValueError):
+    """
+    Exception raised when an assembly sequence is too short.
+
+    This exception is a specialized type of ValueError. It is used when the
+    provided assembly sequence does not meet a predefined minimum length
+    requirement.
+    """
     pass
